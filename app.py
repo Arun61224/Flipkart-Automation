@@ -27,7 +27,7 @@ def process_orders_excel(excel_file: BytesIO) -> pd.DataFrame:
     orders = xls.parse("Orders")
 
     # Fixed columns by header name
-    col_order_id = "Transaction Summary"          # H column -> Order ID
+    col_order_id = "Transaction Summary"          # H column -> Order ID (numeric / whatever Ajio ne diya)
     col_bank_value = "Unnamed: 3"                 # D column -> Bank Settlement Value (Rs.)
 
     if col_order_id not in orders.columns or col_bank_value not in orders.columns:
@@ -148,15 +148,15 @@ def _load_single_sales_df(excel_file: BytesIO) -> pd.DataFrame:
 
     sales = xls.parse(target_sheet)
 
-    # C: Order ID, F: SKU, N: Qty, H: Event
-    order_idx = excel_col_to_idx("C")
-    sku_idx = excel_col_to_idx("F")
-    qty_idx = excel_col_to_idx("N")
-    event_idx = excel_col_to_idx("H")
+    # 🔴 CHANGE: B = Actual Order ID (alpha+numeric), NOT C
+    order_idx = excel_col_to_idx("B")   # Order ID with OD...
+    sku_idx = excel_col_to_idx("F")     # SKU
+    qty_idx = excel_col_to_idx("N")     # Qty
+    event_idx = excel_col_to_idx("H")   # Event
 
     if len(sales.columns) <= max(order_idx, sku_idx, qty_idx, event_idx):
         raise ValueError(
-            "Sale Report sheet does not have enough columns for C/F/N/H "
+            "Sale Report sheet does not have enough columns for B/F/N/H "
             "(Order ID / Seller SKU / Qty / Event)."
         )
 
@@ -284,26 +284,12 @@ def process_multiple_sales(files):
 
 
 # ======================================================
-#   HELPER: EXCEL DOWNLOAD
+#   HELPER: EXCEL DOWNLOAD  -> ONLY FINAL MAPPED SHEET
 # ======================================================
-def to_excel_bytes(
-    df_orders_raw,
-    df_orders_pivot,
-    df_sales_raw=None,
-    df_sales_pivot=None,
-    df_mapping=None,
-):
+def final_report_to_excel_bytes(df_mapping: pd.DataFrame):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df_orders_raw.to_excel(writer, index=False, sheet_name="Settlement_Raw")
-        df_orders_pivot.to_excel(writer, index=False, sheet_name="Settlement_Pivot")
-
-        if df_sales_raw is not None:
-            df_sales_raw.to_excel(writer, index=False, sheet_name="Sales_Raw")
-        if df_sales_pivot is not None:
-            df_sales_pivot.to_excel(writer, index=False, sheet_name="Sales_Pivot")
-        if df_mapping is not None:
-            df_mapping.to_excel(writer, index=False, sheet_name="Final_Mapped_Report")
+        df_mapping.to_excel(writer, index=False, sheet_name="Final_Mapped_Report")
     return output.getvalue()
 
 
@@ -422,24 +408,18 @@ def main():
 
                 st.dataframe(mapping_df, use_container_width=True)
 
-            # -------- Download Excel --------
-            st.markdown("---")
-            st.subheader("Download Excel")
+                # -------- Download ONLY Final sheet --------
+                st.markdown("---")
+                st.subheader("Download Excel")
 
-            excel_bytes = to_excel_bytes(
-                orders_raw,
-                orders_pivot,
-                df_sales_raw=sales_raw,
-                df_sales_pivot=sales_pivot,
-                df_mapping=mapping_df,
-            )
+                excel_bytes = final_report_to_excel_bytes(mapping_df)
 
-            st.download_button(
-                "Download Complete Report",
-                data=excel_bytes,
-                file_name="settlement_sales_final_report.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+                st.download_button(
+                    "Download Final Mapped Report",
+                    data=excel_bytes,
+                    file_name="Final_Mapped_Report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
         except Exception as e:
             st.error(f"Error: {e}")
