@@ -82,15 +82,9 @@ def process_orders_excel(excel_file):
         df_clean.groupby(["Order ID", "Seller SKU"], as_index=False)
         .agg(
             Total_Qty=("Qty", "sum"),
-            Total_Bank_Settlement_Value=(
-                "Bank Settlement Value (Rs.)",
-                "sum",
-            ),
+            Total_Bank_Settlement_Value=("Bank Settlement Value (Rs.)", "sum"),
             Number_of_Records=("Bank Settlement Value (Rs.)", "size"),
-            Average_Bank_Settlement_Value=(
-                "Bank Settlement Value (Rs.)",
-                "mean",
-            ),
+            Average_Bank_Settlement_Value=("Bank Settlement Value (Rs.)", "mean"),
         )
         .sort_values("Total_Bank_Settlement_Value", ascending=False)
     )
@@ -143,36 +137,56 @@ def process_sales_excel(excel_file):
             f'Sale report sheet not found. Available sheets: {", ".join(xls.sheet_names)}'
         )
 
-    # ab jo sheet mila hai use parse karein
     sales = xls.parse(target_sheet)
 
-    # Columns by index: C (Order ID), F (Seller SKU), N (Qty)
+    # Columns by index: C (Order ID), F (Seller SKU), N (Qty), H (Event Type)
     order_idx = excel_col_to_idx("C")
     sku_idx = excel_col_to_idx("F")
     qty_idx = excel_col_to_idx("N")
+    event_idx = excel_col_to_idx("H")
 
-    if len(sales.columns) <= max(order_idx, sku_idx, qty_idx):
+    if len(sales.columns) <= max(order_idx, sku_idx, qty_idx, event_idx):
         raise ValueError(
-            "Sale Report sheet does not have enough columns for C/F/N (Order ID / Seller SKU / Qty)."
+            "Sale Report sheet does not have enough columns for C/F/N/H (Order ID / Seller SKU / Qty / Event)."
         )
 
     col_order = sales.columns[order_idx]
     col_sku = sales.columns[sku_idx]
     col_qty = sales.columns[qty_idx]
+    col_event = sales.columns[event_idx]
 
-    df = sales[[col_order, col_sku, col_qty]].copy()
+    df = sales[[col_order, col_sku, col_qty, col_event]].copy()
 
+    # Clean columns
     df["Order ID"] = df[col_order].astype(str).str.strip()
     df["Seller SKU"] = df[col_sku].apply(clean_sku_text)
     df["Sale Qty"] = pd.to_numeric(df[col_qty], errors="coerce")
+    df["Event"] = df[col_event].astype(str).str.strip()
 
+    # Keep only rows with required fields
     df = df[
-        df["Order ID"].notna()
+        df[col_order].notna()
         & df["Seller SKU"].notna()
         & df["Sale Qty"].notna()
+        & df[col_event].notna()
     ]
 
-    # Pivot by Order ID + Seller SKU
+    # ------------ NEW LOGIC: remove Sale/Return pairs ------------
+    # Group key: Order ID + Seller SKU + Qty
+    def has_sale_and_return(s):
+        vals = s.str.lower().values
+        return int(("sale" in vals) and ("return" in vals))
+
+    pair_mask = (
+        df.groupby(["Order ID", "Seller SKU", "Sale Qty"])["Event"]
+        .transform(has_sale_and_return)
+        .astype(bool)
+    )
+
+    # Drop those groups where both Sale & Return present
+    df = df[~pair_mask]
+
+    # Pivot by Order ID + Seller SKU on remaining rows
     pivot = (
         df.groupby(["Order ID", "Seller SKU"], as_index=False)
         .agg(
@@ -195,9 +209,13 @@ def process_sales_excel(excel_file):
 # -----------------------
 # Helper: Excel Download
 # -----------------------
-def to_excel_bytes(df_orders_raw, df_orders_pivot,
-                   df_sales_raw=None, df_sales_pivot=None,
-                   df_mapping=None):
+def to_excel_bytes(
+    df_orders_raw,
+    df_orders_pivot,
+    df_sales_raw=None,
+    df_sales_pivot=None,
+    df_mapping=None,
+):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df_orders_raw.to_excel(writer, index=False, sheet_name="Orders_Raw")
@@ -228,9 +246,20 @@ def main():
         **Step 1:** Upload your **Settlement Excel** (Orders sheet)  
         **Step 2:** Upload your **Sale Report Excel** (sheet jiske naam me 'Sale' + 'Report' ho)  
 
-        Mapping is done on **Order ID + Seller SKU**  
-        - Settlement: H (Order ID), BG (Seller SKU), BH (Qty), D (Bank Settlement)  
-        - Sales: C (Order ID), F (Seller SKU - cleaned), N (Qty)
+        Mapping on **Order ID + Seller SKU**
+
+        **Settlement file**  
+        - H → Order ID  
+        - BG → Seller SKU  
+        - BH → Qty  
+        - D → Bank Settlement Value (Rs.)
+
+        **Sale report**  
+        - C → Order ID  
+        - F → Seller SKU (e.g. `"SKU:ABC-123"` → `ABC-123`)  
+        - N → Qty  
+        - H → Event Type (`Sale` / `Return`)  
+        - Jitne bhi `Sale` + `Return` pairs ho **same Order ID + SKU + Qty** ke for unko cancel (rows delete).
         """
     )
 
@@ -290,7 +319,7 @@ def main():
                 s3.metric("Total Rows", sales_summary["total_rows"])
                 s4.metric("Total Sale Qty", sales_summary["grand_sale_qty"])
 
-                with st.expander("📄 View Sale Report Raw Data", expanded=False):
+                with st.expander("📄 View Sale Report Raw Data (after Sale/Return cancel)", expanded=False):
                     st.dataframe(sales_raw, use_container_width=True)
 
                 st.subheader("📑 Sales Pivot (Order ID + Seller SKU)")
