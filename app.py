@@ -252,6 +252,8 @@ def summarize_sales(df: pd.DataFrame):
         )
         .rename(
             columns={
+                "Order_Date": "Order Date",
+                "Item_Quantity": "Item Quantity",
                 "Final_Invoice_Amount": "Final Invoice Amount (Price after discount+Shipping Charges)",
             }
         )
