@@ -15,10 +15,10 @@ def excel_col_to_idx(col_name: str) -> int:
     return idx - 1  # 0-based index
 
 
-# -----------------------
-# PROCESS 1: Settlement file (Orders sheet)
-# -----------------------
-def process_orders_excel(excel_file):
+# ======================================================
+#   PART 1 – SETTLEMENT FILES (Orders sheet)
+# ======================================================
+def process_orders_excel(excel_file: BytesIO) -> pd.DataFrame:
     xls = pd.ExcelFile(excel_file)
 
     if "Orders" not in xls.sheet_names:
@@ -72,62 +72,71 @@ def process_orders_excel(excel_file):
         columns={
             col_order_id: "Order ID",
             col_seller_sku: "Seller SKU",
-            col_qty: "Qty",
-            col_bank_value: "Bank Settlement Value (Rs.)",
+            col_qty: "Settlement Qty",
+            col_bank_value: "Payment Received",
         }
     )
 
-    # Pivot: group by Order ID + Seller SKU
+    return df_clean
+
+
+def summarize_orders(df_clean: pd.DataFrame):
+    # Pivot per Order ID + Seller SKU
     pivot = (
         df_clean.groupby(["Order ID", "Seller SKU"], as_index=False)
         .agg(
-            Total_Qty=("Qty", "sum"),
-            Total_Bank_Settlement_Value=("Bank Settlement Value (Rs.)", "sum"),
-            Number_of_Records=("Bank Settlement Value (Rs.)", "size"),
-            Average_Bank_Settlement_Value=("Bank Settlement Value (Rs.)", "mean"),
+            Settlement_Qty=("Settlement Qty", "sum"),
+            Payment_Received=("Payment Received", "sum"),
+            Number_of_Records=("Payment Received", "size"),
+            Avg_Payment_Received=("Payment Received", "mean"),
         )
-        .sort_values("Total_Bank_Settlement_Value", ascending=False)
+        .sort_values("Payment_Received", ascending=False)
     )
 
-    # Summary KPIs
     summary = {
         "total_unique_orders": df_clean["Order ID"].nunique(),
         "total_unique_sku": df_clean["Seller SKU"].nunique(),
         "total_rows": df_clean.shape[0],
-        "grand_qty": df_clean["Qty"].sum(),
-        "grand_total_bank": df_clean["Bank Settlement Value (Rs.)"].sum(),
+        "grand_qty": df_clean["Settlement Qty"].sum(),
+        "grand_total_payment": df_clean["Payment Received"].sum(),
     }
+    return pivot, summary
 
-    return df_clean, pivot, summary
+
+def process_multiple_orders(files):
+    all_raw = []
+    for f in files:
+        df_clean = process_orders_excel(f)
+        all_raw.append(df_clean)
+
+    combined_raw = pd.concat(all_raw, ignore_index=True)
+    combined_pivot, combined_summary = summarize_orders(combined_raw)
+    return combined_raw, combined_pivot, combined_summary
 
 
-# -----------------------
-# PROCESS 2: Sale Report file (Sale Report sheet)
-# -----------------------
+# ======================================================
+#   PART 2 – SALES REPORT FILES
+# ======================================================
 def clean_sku_text(val):
     if pd.isna(val):
         return None
     s = str(val).strip()
-    # remove surrounding quotes
     s = s.strip('"').strip("'").strip()
-    # remove "SKU:" prefix (case-insensitive)
     if s.upper().startswith("SKU:"):
         s = s[4:]
     return s.strip()
 
 
-def process_sales_excel(excel_file):
+def _load_single_sales_df(excel_file: BytesIO) -> pd.DataFrame:
     xls = pd.ExcelFile(excel_file)
 
-    # ---- Sheet name ko flexibly detect karo ----
+    # ---- Sheet name flex detect: something with "sale" + "report" ----
     target_sheet = None
     for s in xls.sheet_names:
         s_clean = s.strip().lower().replace(" ", "")
-        # exact style: "Sale Report", "sale report", etc.
         if s_clean == "salereport":
             target_sheet = s
             break
-        # generic: jisme "sale" + "report" dono hon
         if "sale" in s_clean and "report" in s_clean:
             target_sheet = s
             break
@@ -139,11 +148,11 @@ def process_sales_excel(excel_file):
 
     sales = xls.parse(target_sheet)
 
-    # Columns by index: C (Order ID), F (Seller SKU), N (Qty), H (Event Type)
-    order_idx = excel_col_to_idx("C")
-    sku_idx = excel_col_to_idx("F")
-    qty_idx = excel_col_to_idx("N")
-    event_idx = excel_col_to_idx("H")
+    # Index-based columns
+    order_idx = excel_col_to_idx("C")   # Order ID
+    sku_idx = excel_col_to_idx("F")     # SKU raw
+    qty_idx = excel_col_to_idx("N")     # Item Quantity
+    event_idx = excel_col_to_idx("H")   # Event Type
 
     if len(sales.columns) <= max(order_idx, sku_idx, qty_idx, event_idx):
         raise ValueError(
@@ -155,60 +164,126 @@ def process_sales_excel(excel_file):
     col_qty = sales.columns[qty_idx]
     col_event = sales.columns[event_idx]
 
-    df = sales[[col_order, col_sku, col_qty, col_event]].copy()
+    # Order Date column – by name
+    col_order_date = None
+    for c in sales.columns:
+        if "order date" in str(c).lower():
+            col_order_date = c
+            break
+    if col_order_date is None:
+        raise ValueError(
+            "Could not find 'Order Date' column in Sale Report. "
+            f"Available columns: {list(sales.columns)}"
+        )
 
-    # Clean columns
+    # Final Invoice Amount column – by name (price after discount+shipping)
+    col_invoice = None
+    for c in sales.columns:
+        txt = str(c).lower()
+        if "final invoice amount" in txt or "price after discount" in txt:
+            col_invoice = c
+            break
+    if col_invoice is None:
+        raise ValueError(
+            "Could not find 'Final Invoice Amount (Price after discount+Shipping Charges)' column "
+            "in Sale Report."
+        )
+
+    df = sales[[col_order_date, col_order, col_sku, col_qty, col_event, col_invoice]].copy()
+
+    # Standardized fields
+    df["Order Date"] = pd.to_datetime(df[col_order_date], errors="coerce")
     df["Order ID"] = df[col_order].astype(str).str.strip()
-    df["Seller SKU"] = df[col_sku].apply(clean_sku_text)
-    df["Sale Qty"] = pd.to_numeric(df[col_qty], errors="coerce")
+    df["SKU"] = df[col_sku].apply(clean_sku_text)
+    df["Item Quantity"] = pd.to_numeric(df[col_qty], errors="coerce")
     df["Event"] = df[col_event].astype(str).str.strip()
+    df["Final Invoice Amount (Price after discount+Shipping Charges)"] = pd.to_numeric(
+        df[col_invoice], errors="coerce"
+    )
 
     # Keep only rows with required fields
     df = df[
-        df[col_order].notna()
-        & df["Seller SKU"].notna()
-        & df["Sale Qty"].notna()
-        & df[col_event].notna()
+        df["Order ID"].notna()
+        & df["SKU"].notna()
+        & df["Item Quantity"].notna()
+        & df["Final Invoice Amount (Price after discount+Shipping Charges)"].notna()
+        & df["Event"].notna()
     ]
 
-    # ------------ NEW LOGIC: remove Sale/Return pairs ------------
-    # Group key: Order ID + Seller SKU + Qty
-    def has_sale_and_return(s):
+    return df[
+        [
+            "Order Date",
+            "Order ID",
+            "SKU",
+            "Item Quantity",
+            "Final Invoice Amount (Price after discount+Shipping Charges)",
+            "Event",
+        ]
+    ]
+
+
+def summarize_sales(df: pd.DataFrame):
+    # --------- Remove matching Return rows only ----------
+    # pair exists flag per (Order ID, SKU, Qty)
+    group_key = ["Order ID", "SKU", "Item Quantity"]
+
+    def pair_flag(s):
         vals = s.str.lower().values
         return int(("sale" in vals) and ("return" in vals))
 
-    pair_mask = (
-        df.groupby(["Order ID", "Seller SKU", "Sale Qty"])["Event"]
-        .transform(has_sale_and_return)
+    pair_exists = (
+        df.groupby(group_key)["Event"]
+        .transform(pair_flag)
         .astype(bool)
     )
 
-    # Drop those groups where both Sale & Return present
-    df = df[~pair_mask]
+    # Drop only returns where pair exists
+    is_return = df["Event"].str.lower().eq("return")
+    drop_mask = pair_exists & is_return
+    df_clean = df[~drop_mask].copy()
 
-    # Pivot by Order ID + Seller SKU on remaining rows
-    pivot = (
-        df.groupby(["Order ID", "Seller SKU"], as_index=False)
+    # Pivot (aggregated per Order ID + SKU)
+    sales_pivot = (
+        df_clean.groupby(["Order ID", "SKU"], as_index=False)
         .agg(
-            Total_Sale_Qty=("Sale Qty", "sum"),
-            Number_of_Sale_Rows=("Sale Qty", "size"),
+            Order_Date=("Order Date", "min"),
+            Item_Quantity=("Item Quantity", "sum"),
+            Final_Invoice_Amount=("Final Invoice Amount (Price after discount+Shipping Charges)", "sum"),
         )
-        .sort_values("Total_Sale_Qty", ascending=False)
+        .rename(
+            columns={
+                "Final_Invoice_Amount": "Final Invoice Amount (Price after discount+Shipping Charges)",
+            }
+        )
     )
 
     summary = {
-        "total_unique_orders": df["Order ID"].nunique(),
-        "total_unique_sku": df["Seller SKU"].nunique(),
-        "total_rows": df.shape[0],
-        "grand_sale_qty": df["Sale Qty"].sum(),
+        "total_unique_orders": df_clean["Order ID"].nunique(),
+        "total_unique_sku": df_clean["SKU"].nunique(),
+        "total_rows": df_clean.shape[0],
+        "grand_sale_qty": df_clean["Item Quantity"].sum(),
+        "grand_invoice_amount": df_clean[
+            "Final Invoice Amount (Price after discount+Shipping Charges)"
+        ].sum(),
     }
 
-    return df, pivot, summary
+    return df_clean, sales_pivot, summary
 
 
-# -----------------------
-# Helper: Excel Download
-# -----------------------
+def process_multiple_sales(files):
+    all_raw = []
+    for f in files:
+        df_one = _load_single_sales_df(f)
+        all_raw.append(df_one)
+
+    combined_raw = pd.concat(all_raw, ignore_index=True)
+    cleaned_sales, pivot, summary = summarize_sales(combined_raw)
+    return cleaned_sales, pivot, summary
+
+
+# ======================================================
+#   HELPER: EXCEL DOWNLOAD
+# ======================================================
 def to_excel_bytes(
     df_orders_raw,
     df_orders_pivot,
@@ -218,137 +293,154 @@ def to_excel_bytes(
 ):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df_orders_raw.to_excel(writer, index=False, sheet_name="Orders_Raw")
-        df_orders_pivot.to_excel(writer, index=False, sheet_name="Orders_Pivot")
+        df_orders_raw.to_excel(writer, index=False, sheet_name="Settlement_Raw")
+        df_orders_pivot.to_excel(writer, index=False, sheet_name="Settlement_Pivot")
 
         if df_sales_raw is not None:
             df_sales_raw.to_excel(writer, index=False, sheet_name="Sales_Raw")
         if df_sales_pivot is not None:
             df_sales_pivot.to_excel(writer, index=False, sheet_name="Sales_Pivot")
         if df_mapping is not None:
-            df_mapping.to_excel(writer, index=False, sheet_name="Mapping")
+            df_mapping.to_excel(writer, index=False, sheet_name="Final_Mapped_Report")
     return output.getvalue()
 
 
-# -----------------------
-# Streamlit App
-# -----------------------
+# ======================================================
+#   STREAMLIT APP
+# ======================================================
 def main():
     st.set_page_config(
-        page_title="Settlement Pivot Tool",
+        page_title="Settlement–Sales Mapping Tool",
         page_icon="📊",
         layout="wide",
     )
-    st.title("📊 Settlement Pivot & Sales Mapping Tool")
+    st.title("📊 Settlement & Sales Mapping Tool")
 
     st.markdown(
         """
-        **Step 1:** Upload your **Settlement Excel** (Orders sheet)  
-        **Step 2:** Upload your **Sale Report Excel** (sheet jiske naam me 'Sale' + 'Report' ho)  
+        **Step 1:** Upload one or more **Settlement Excel** files (each me `Orders` sheet)  
+        **Step 2:** Upload one or more **Sale Report Excel** files (sheet jiske naam me 'Sale' + 'Report' ho)  
 
-        Mapping on **Order ID + Seller SKU**
+        Final report base hoga **Sales Report** par, columns:
 
-        **Settlement file**  
-        - H → Order ID  
-        - BG → Seller SKU  
-        - BH → Qty  
-        - D → Bank Settlement Value (Rs.)
-
-        **Sale report**  
-        - C → Order ID  
-        - F → Seller SKU (e.g. `"SKU:ABC-123"` → `ABC-123`)  
-        - N → Qty  
-        - H → Event Type (`Sale` / `Return`)  
-        - Jitne bhi `Sale` + `Return` pairs ho **same Order ID + SKU + Qty** ke for unko cancel (rows delete).
+        - Order Date  
+        - Order ID  
+        - SKU (cleaned from `SKU:...`)  
+        - Item Quantity  
+        - Final Invoice Amount (Price after discount+Shipping Charges)  
+        - Payment Received (from Settlement, mapped on Order ID + SKU)  
+        - Settlement Qty & Qty Diff (optional check)
         """
     )
 
     col_up1, col_up2 = st.columns(2)
 
     with col_up1:
-        settlement_file = st.file_uploader(
-            "📁 Upload Settlement Excel (Orders sheet)",
+        settlement_files = st.file_uploader(
+            "📁 Upload Settlement Excel file(s) (Orders sheet)",
             type=["xlsx", "xls"],
-            key="settlement_file",
+            key="settlement_files",
+            accept_multiple_files=True,
         )
 
     with col_up2:
-        sales_file = st.file_uploader(
-            "📁 Upload Sale Report Excel",
+        sales_files = st.file_uploader(
+            "📁 Upload Sale Report Excel file(s)",
             type=["xlsx", "xls"],
-            key="sales_file",
+            key="sales_files",
+            accept_multiple_files=True,
         )
 
-    if settlement_file:
+    if settlement_files:
         try:
-            with st.spinner("Processing Settlement (Orders) file..."):
-                orders_raw, orders_pivot, orders_summary = process_orders_excel(
-                    settlement_file
+            with st.spinner("Processing Settlement file(s)..."):
+                orders_raw, orders_pivot, orders_summary = process_multiple_orders(
+                    settlement_files
                 )
 
-            st.subheader("📌 Settlement Summary (Orders)")
+            st.subheader("📌 Settlement Summary (All Files Combined)")
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Unique Orders", orders_summary["total_unique_orders"])
             c2.metric("Unique SKUs", orders_summary["total_unique_sku"])
             c3.metric("Total Rows", orders_summary["total_rows"])
-            c4.metric("Total Qty", orders_summary["grand_qty"])
+            c4.metric("Total Qty (Settlement)", orders_summary["grand_qty"])
             c5.metric(
-                "Total Bank Settlement (Rs.)",
-                f"{orders_summary['grand_total_bank']:.2f}",
+                "Total Payment Received (Rs.)",
+                f"{orders_summary['grand_total_payment']:.2f}",
             )
 
-            with st.expander("📄 View Settlement Raw Data", expanded=False):
+            with st.expander("📄 View Settlement Raw Data (Combined)", expanded=False):
                 st.dataframe(orders_raw, use_container_width=True)
 
-            st.subheader("📑 Settlement Pivot (Order ID + Seller SKU)")
+            st.subheader("📑 Settlement Pivot (Order ID + SKU)")
             st.dataframe(orders_pivot, use_container_width=True)
 
-            # ---- If Sales Report also uploaded, process & map ----
+            # ---- Sales + Mapping ----
             sales_raw = sales_pivot = mapping_df = sales_summary = None
 
-            if sales_file:
-                with st.spinner("Processing Sale Report file..."):
-                    sales_raw, sales_pivot, sales_summary = process_sales_excel(
-                        sales_file
+            if sales_files:
+                with st.spinner("Processing Sale Report file(s)..."):
+                    sales_raw, sales_pivot, sales_summary = process_multiple_sales(
+                        sales_files
                     )
 
-                st.subheader("🧾 Sales Summary (Sale Report)")
-                s1, s2, s3, s4 = st.columns(4)
+                st.subheader("🧾 Sales Summary (All Files Combined)")
+                s1, s2, s3, s4, s5 = st.columns(5)
                 s1.metric("Unique Orders", sales_summary["total_unique_orders"])
                 s2.metric("Unique SKUs", sales_summary["total_unique_sku"])
-                s3.metric("Total Rows", sales_summary["total_rows"])
+                s3.metric("Total Rows (after return removal)", sales_summary["total_rows"])
                 s4.metric("Total Sale Qty", sales_summary["grand_sale_qty"])
-
-                with st.expander("📄 View Sale Report Raw Data (after Sale/Return cancel)", expanded=False):
-                    st.dataframe(sales_raw, use_container_width=True)
-
-                st.subheader("📑 Sales Pivot (Order ID + Seller SKU)")
-                st.dataframe(sales_pivot, use_container_width=True)
-
-                # -------- MAPPING --------
-                st.subheader("🔗 Mapping: Settlement vs Sale Report")
-
-                mapping_df = orders_pivot.merge(
-                    sales_pivot,
-                    on=["Order ID", "Seller SKU"],
-                    how="outer",
+                s5.metric(
+                    "Total Invoice Amount",
+                    f"{sales_summary['grand_invoice_amount']:.2f}",
                 )
 
-                # Fill NaNs
-                if "Total_Qty" in mapping_df.columns:
-                    mapping_df["Total_Qty"] = mapping_df["Total_Qty"].fillna(0)
-                if "Total_Sale_Qty" in mapping_df.columns:
-                    mapping_df["Total_Sale_Qty"] = mapping_df["Total_Sale_Qty"].fillna(0)
+                with st.expander(
+                    "📄 View Sales Raw Data (after Sale/Return clean, Combined)",
+                    expanded=False,
+                ):
+                    st.dataframe(sales_raw, use_container_width=True)
 
-                # Qty difference (Settlement - Sales)
-                if "Total_Qty" in mapping_df.columns and "Total_Sale_Qty" in mapping_df.columns:
-                    mapping_df["Qty_Diff (Settle - Sale)"] = (
-                        mapping_df["Total_Qty"] - mapping_df["Total_Sale_Qty"]
-                    )
+                st.subheader("📑 Sales Pivot (Order ID + SKU)")
+                st.dataframe(sales_pivot, use_container_width=True)
+
+                # -------- FINAL MAPPING (Sales-driven) --------
+                st.subheader("🔗 Final Mapped Report (Sales → Settlement)")
+
+                # left join: all sales rows, settlement optional
+                mapping_df = sales_pivot.merge(
+                    orders_pivot[["Order ID", "Seller SKU", "Settlement_Qty", "Payment_Received"]],
+                    left_on=["Order ID", "SKU"],
+                    right_on=["Order ID", "Seller SKU"],
+                    how="left",
+                )
+
+                # clean up columns
+                mapping_df = mapping_df.drop(columns=["Seller SKU"], errors="ignore")
+                mapping_df["Settlement_Qty"] = mapping_df["Settlement_Qty"].fillna(0)
+                mapping_df["Payment_Received"] = mapping_df["Payment_Received"].fillna(0.0)
+
+                # Qty diff: Settlement - Sale
+                mapping_df["Qty_Diff (Settlement - Sale)"] = (
+                    mapping_df["Settlement_Qty"] - mapping_df["Item Quantity"]
+                )
+
+                # reorder columns
+                col_order = [
+                    "Order Date",
+                    "Order ID",
+                    "SKU",
+                    "Item Quantity",
+                    "Final Invoice Amount (Price after discount+Shipping Charges)",
+                    "Settlement_Qty",
+                    "Qty_Diff (Settlement - Sale)",
+                    "Payment_Received",
+                ]
+                mapping_df = mapping_df[[c for c in col_order if c in mapping_df.columns]]
 
                 st.dataframe(mapping_df, use_container_width=True)
 
-            # ---- Download (Settlement only OR Settlement + Sales + Mapping) ----
+            # ---- Download full Excel ----
             st.markdown("---")
             st.subheader("⬇️ Download Report Excel")
 
@@ -363,7 +455,7 @@ def main():
             st.download_button(
                 "Download Complete Report (Excel)",
                 data=excel_bytes,
-                file_name="settlement_sales_mapping.xlsx",
+                file_name="settlement_sales_final_report.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
