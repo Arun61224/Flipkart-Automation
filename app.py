@@ -216,21 +216,13 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
 
 
 def summarize_sales(df: pd.DataFrame):
-    group_key = ["Order ID", "SKU", "Item Quantity"]
-
-    def pair_flag(s):
-        vals = s.str.lower().values
-        return int(("sale" in vals) and ("return" in vals))
-
-    pair_exists = (
-        df.groupby(group_key)["Event"]
-        .transform(pair_flag)
-        .astype(bool)
-    )
-
-    is_return = df["Event"].str.lower().eq("return")
-    drop_mask = pair_exists & is_return
-    df_clean = df[~drop_mask].copy()
+    """
+    NEW LOGIC:
+    - saari 'Return' rows hata do
+    - baaki (Sale, etc.) pe pivot banao
+    """
+    # drop all returns
+    df_clean = df[~df["Event"].str.lower().eq("return")].copy()
 
     sales_pivot = (
         df_clean.groupby(["Order ID", "SKU"], as_index=False)
@@ -282,17 +274,15 @@ def process_multiple_sales_cached(files_bytes_list):
 @st.cache_data(show_spinner=False)
 def process_cost_file_cached(file_bytes: bytes) -> pd.DataFrame:
     bio = BytesIO(file_bytes)
-    # first sheet
     df = pd.read_excel(bio, sheet_name=0, engine="openpyxl")
 
-    # find SKU column
     sku_col = None
     cost_col = None
     for c in df.columns:
         txt = str(c).lower()
         if "sku" in txt and sku_col is None:
             sku_col = c
-        if ("cost" in txt or "cost price" in txt or "cp" == txt) and cost_col is None:
+        if ("cost" in txt or "cost price" in txt or txt == "cp") and cost_col is None:
             cost_col = c
 
     if sku_col is None:
@@ -394,8 +384,7 @@ def main():
                 - mapping_df["Final Invoice Amount (Price after discount+Shipping Charges)"]
             )
 
-            # ---- Merge Cost Price (optional but recommended) ----
-            total_cost = 0.0
+            # ---- Merge Cost Price ----
             if cost_file is not None:
                 cost_bytes = cost_file.getvalue()
                 with st.spinner("Processing Cost Price file..."):
@@ -406,7 +395,6 @@ def main():
                 mapping_df["Total Cost (Qty * Cost)"] = (
                     mapping_df["Item Quantity"] * mapping_df["Cost Price"]
                 )
-                total_cost = mapping_df["Total Cost (Qty * Cost)"].sum()
             else:
                 mapping_df["Cost Price"] = 0.0
                 mapping_df["Total Cost (Qty * Cost)"] = 0.0
@@ -506,7 +494,7 @@ def main():
             with tab3:
                 st.write("Settlement Pivot")
                 st.dataframe(orders_pivot, use_container_width=True)
-                st.write("Sales Pivot (after returns)")
+                st.write("Sales Pivot (after removing all returns)")
                 st.dataframe(sales_pivot, use_container_width=True)
 
             # -------- Download ONLY Final sheet --------
