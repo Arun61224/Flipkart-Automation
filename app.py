@@ -3,6 +3,19 @@ import pandas as pd
 from io import BytesIO
 
 # -----------------------
+# Helper: Excel column name -> 0-based index
+# Example: "A"->0, "H"->7, "BG"->58, "BH"->59
+# -----------------------
+def excel_col_to_idx(col_name: str) -> int:
+    col_name = col_name.strip().upper()
+    idx = 0
+    for c in col_name:
+        if "A" <= c <= "Z":
+            idx = idx * 26 + (ord(c) - ord("A") + 1)
+    return idx - 1  # 0-based index
+
+
+# -----------------------
 # Helper function: Process Orders sheet
 # -----------------------
 def process_orders_excel(excel_file):
@@ -13,62 +26,78 @@ def process_orders_excel(excel_file):
 
     orders = xls.parse("Orders")
 
-    # Column mapping
-    col_order_id = "Transaction Summary"          # H
-    col_bank_value = "Unnamed: 3"                 # D
-    col_seller_sku = "Seller SKU"                 # BG
-    col_qty = "Quantity"                          # BH (assuming correct header name if present)
+    # ---- Fixed columns (by header name – ye pehle se sahi chal rahe the) ----
+    col_order_id = "Transaction Summary"          # H column -> Order ID
+    col_bank_value = "Unnamed: 3"                 # D column -> Bank Settlement Value (Rs.)
 
-    # Possible mismatch fix (BG/BH sometimes show as Unnamed if empty header)
-    for col in orders.columns:
-        if "SKU" in str(col):
-            col_seller_sku = col
-        if "Qty" in str(col) or "Quantity" in str(col):
-            col_qty = col
+    if col_order_id not in orders.columns or col_bank_value not in orders.columns:
+        raise ValueError(
+            'Expected columns not found. Check if "Transaction Summary" (Order ID) '
+            'and "Unnamed: 3" (Bank Settlement Value) exist in the "Orders" sheet.'
+        )
 
-    required_cols = [col_order_id, col_bank_value, col_seller_sku, col_qty]
-    for c in required_cols:
-        if c not in orders.columns:
-            raise ValueError(f"Column missing in sheet → {c}")
+    # ---- NEW: Seller SKU (BG) and Qty (BH) by column index, not header text ----
+    sku_idx = excel_col_to_idx("BG")   # 0-based index for BG
+    qty_idx = excel_col_to_idx("BH")   # 0-based index for BH
 
-    # Keep only order rows
+    if len(orders.columns) <= max(sku_idx, qty_idx):
+        raise ValueError(
+            "Orders sheet does not have enough columns to read BG/BH (Seller SKU / Qty)."
+        )
+
+    col_seller_sku = orders.columns[sku_idx]
+    col_qty = orders.columns[qty_idx]
+
+    # -----------------------
+    # Filter rows jahan Order ID "OD" se start hota hai
+    # -----------------------
     df = orders.copy()
     df = df[df[col_order_id].astype(str).str.startswith("OD", na=False)]
 
     if df.empty:
-        raise ValueError("No Order IDs starting with 'OD' found.")
+        raise ValueError("No order rows found starting with 'OD' in Order ID column.")
 
-    # Cast values
+    # Numeric conversion
     df[col_bank_value] = pd.to_numeric(df[col_bank_value], errors="coerce")
     df[col_qty] = pd.to_numeric(df[col_qty], errors="coerce")
 
+    # Remove rows with missing key values
     df = df[
-        df[col_order_id].notna() &
-        df[col_bank_value].notna() &
-        df[col_seller_sku].notna() &
-        df[col_qty].notna()
+        df[col_order_id].notna()
+        & df[col_bank_value].notna()
+        & df[col_seller_sku].notna()
+        & df[col_qty].notna()
     ]
 
-    # Clean data
+    # Clean dataframe with nice column names
     df_clean = df[[col_order_id, col_seller_sku, col_qty, col_bank_value]].rename(
         columns={
             col_order_id: "Order ID",
             col_seller_sku: "Seller SKU",
             col_qty: "Qty",
-            col_bank_value: "Bank Settlement Value (Rs.)"
+            col_bank_value: "Bank Settlement Value (Rs.)",
         }
     )
 
     # -----------------------
-    # Pivot summary
-    # Group by Order ID + Seller SKU
+    # Pivot: group by Order ID + Seller SKU
     # -----------------------
-    pivot = df_clean.groupby(["Order ID", "Seller SKU"], as_index=False).agg(
-        Total_Qty=("Qty", "sum"),
-        Total_Bank_Settlement_Value=("Bank Settlement Value (Rs.)", "sum"),
-        Number_of_Records=("Bank Settlement Value (Rs.)", "size"),
-        Average_Bank_Settlement_Value=("Bank Settlement Value (Rs.)", "mean")
-    ).sort_values("Total_Bank_Settlement_Value", ascending=False)
+    pivot = (
+        df_clean.groupby(["Order ID", "Seller SKU"], as_index=False)
+        .agg(
+            Total_Qty=("Qty", "sum"),
+            Total_Bank_Settlement_Value=(
+                "Bank Settlement Value (Rs.)",
+                "sum",
+            ),
+            Number_of_Records=("Bank Settlement Value (Rs.)", "size"),
+            Average_Bank_Settlement_Value=(
+                "Bank Settlement Value (Rs.)",
+                "mean",
+            ),
+        )
+        .sort_values("Total_Bank_Settlement_Value", ascending=False)
+    )
 
     # Summary KPIs
     summary = {
@@ -76,7 +105,7 @@ def process_orders_excel(excel_file):
         "total_unique_sku": df_clean["Seller SKU"].nunique(),
         "total_rows": df_clean.shape[0],
         "grand_qty": df_clean["Qty"].sum(),
-        "grand_total_bank": df_clean["Bank Settlement Value (Rs.)"].sum()
+        "grand_total_bank": df_clean["Bank Settlement Value (Rs.)"].sum(),
     }
 
     return df_clean, pivot, summary
@@ -97,10 +126,27 @@ def to_excel_bytes(df_raw, df_pivot):
 # Streamlit App
 # -----------------------
 def main():
-    st.set_page_config(page_title="Settlement Pivot Tool", page_icon="📊", layout="wide")
+    st.set_page_config(
+        page_title="Settlement Pivot Tool",
+        page_icon="📊",
+        layout="wide",
+    )
     st.title("📊 Settlement Pivot Tool — Orders + SKU + Qty")
 
-    uploaded_file = st.file_uploader("📁 Upload your Settlement Excel file", type=["xlsx", "xls"])
+    st.write(
+        """
+        Upload your settlement Excel file.  
+        App uses **Orders** sheet and reads:
+        - H → Order ID  
+        - D → Bank Settlement Value (Rs.)  
+        - BG → Seller SKU (data from row 4)  
+        - BH → Qty (data from row 4)
+        """
+    )
+
+    uploaded_file = st.file_uploader(
+        "📁 Upload your Settlement Excel file", type=["xlsx", "xls"]
+    )
 
     if uploaded_file:
         try:
@@ -113,7 +159,10 @@ def main():
             col2.metric("Unique SKUs", summary["total_unique_sku"])
             col3.metric("Total Rows", summary["total_rows"])
             col4.metric("Total Qty", summary["grand_qty"])
-            col5.metric("Total Bank Settlement (Rs.)", f"{summary['grand_total_bank']:.2f}")
+            col5.metric(
+                "Total Bank Settlement (Rs.)",
+                f"{summary['grand_total_bank']:.2f}",
+            )
 
             with st.expander("📄 View Raw Data", expanded=False):
                 st.dataframe(df_clean, use_container_width=True)
@@ -126,7 +175,7 @@ def main():
                 "⬇️ Download Pivot Excel",
                 data=excel_bytes,
                 file_name="settlement_sku_pivot.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
         except Exception as e:
@@ -135,4 +184,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
