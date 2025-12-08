@@ -17,13 +17,19 @@ def excel_col_to_idx(col_name: str) -> int:
 # ======================================================
 #   PART 1 – SETTLEMENT FILES (Orders sheet)
 # ======================================================
-def process_orders_excel(excel_file: BytesIO) -> pd.DataFrame:
-    xls = pd.ExcelFile(excel_file)
+def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
+    bio = BytesIO(file_bytes)
+    xls = pd.ExcelFile(bio)
 
     if "Orders" not in xls.sheet_names:
         raise ValueError('Sheet named "Orders" not found in the uploaded file.')
 
-    orders = xls.parse("Orders")
+    # Sirf zaroori columns read karo (thoda fast)
+    orders = pd.read_excel(
+        bio,
+        sheet_name="Orders",
+        engine="openpyxl",
+    )
 
     col_order_id = "Transaction Summary"          # H column -> Order ID
     col_bank_value = "Unnamed: 3"                 # D column -> Bank Settlement Value (Rs.)
@@ -96,10 +102,12 @@ def summarize_orders(df_clean: pd.DataFrame):
     return pivot, summary
 
 
-def process_multiple_orders(files):
+@st.cache_data(show_spinner=False)
+def process_multiple_orders_cached(files_bytes_list):
+    """Heavy settlement processing – cached"""
     all_raw = []
-    for f in files:
-        df_clean = process_orders_excel(f)
+    for fb in files_bytes_list:
+        df_clean = process_orders_excel_from_bytes(fb)
         all_raw.append(df_clean)
 
     combined_raw = pd.concat(all_raw, ignore_index=True)
@@ -120,8 +128,9 @@ def clean_sku_text(val):
     return s.strip()
 
 
-def _load_single_sales_df(excel_file: BytesIO) -> pd.DataFrame:
-    xls = pd.ExcelFile(excel_file)
+def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
+    bio = BytesIO(file_bytes)
+    xls = pd.ExcelFile(bio)
 
     # sheet name detect (contains "sale" + "report")
     target_sheet = None
@@ -139,7 +148,7 @@ def _load_single_sales_df(excel_file: BytesIO) -> pd.DataFrame:
             f'Sale report sheet not found. Available sheets: {", ".join(xls.sheet_names)}'
         )
 
-    sales = xls.parse(target_sheet)
+    sales = pd.read_excel(bio, sheet_name=target_sheet, engine="openpyxl")
 
     # B: Order ID (OD...), F: SKU, N: Qty, H: Event
     order_idx = excel_col_to_idx("B")
@@ -260,10 +269,12 @@ def summarize_sales(df: pd.DataFrame):
     return df_clean, sales_pivot, summary
 
 
-def process_multiple_sales(files):
+@st.cache_data(show_spinner=False)
+def process_multiple_sales_cached(files_bytes_list):
+    """Heavy sales processing – cached"""
     all_raw = []
-    for f in files:
-        df_one = _load_single_sales_df(f)
+    for fb in files_bytes_list:
+        df_one = load_single_sales_df_from_bytes(fb)
         all_raw.append(df_one)
 
     combined_raw = pd.concat(all_raw, ignore_index=True)
@@ -313,26 +324,23 @@ def main():
 
     st.markdown("---")
 
-    if settlement_files:
+    if settlement_files and sales_files:
         try:
-            # -------- Settlement processing --------
-            with st.spinner("Processing Settlement file(s)..."):
-                orders_raw, orders_pivot, orders_summary = process_multiple_orders(
-                    settlement_files
-                )
+            # bytes list banalo (cache-friendly)
+            settlement_bytes_list = [f.getvalue() for f in settlement_files]
+            sales_bytes_list = [f.getvalue() for f in sales_files]
 
-            # -------- Sales processing --------
-            sales_raw = sales_pivot = mapping_df = sales_summary = None
-            if not sales_files:
-                st.warning("Upload Sale Report files also for full reconciliation.")
-                return
+            with st.spinner("Processing Settlement file(s)..."):
+                orders_raw, orders_pivot, orders_summary = process_multiple_orders_cached(
+                    settlement_bytes_list
+                )
 
             with st.spinner("Processing Sale Report file(s)..."):
-                sales_raw, sales_pivot, sales_summary = process_multiple_sales(
-                    sales_files
+                sales_raw, sales_pivot, sales_summary = process_multiple_sales_cached(
+                    sales_bytes_list
                 )
 
-            # ---- Final mapping: Sales → Settlement (CALCULATION SAME AS BEFORE) ----
+            # ---- Final mapping: Sales → Settlement (same logic) ----
             mapping_df = sales_pivot.merge(
                 orders_pivot[["Order ID", "Seller SKU", "Settlement_Qty", "Payment_Received"]],
                 left_on=["Order ID", "SKU"],
@@ -347,14 +355,11 @@ def main():
             mapping_df["Qty_Diff (Settlement - Sale)"] = (
                 mapping_df["Settlement_Qty"] - mapping_df["Item Quantity"]
             )
-
-            # Amount diff (sirf dashboard ke liye, logic nahi badla)
             mapping_df["Amount_Diff (Settlement - Invoice)"] = (
                 mapping_df["Payment_Received"]
                 - mapping_df["Final Invoice Amount (Price after discount+Shipping Charges)"]
             )
 
-            # ---- Final columns order (report) ----
             col_order = [
                 "Order Date",
                 "Order ID",
@@ -368,33 +373,26 @@ def main():
             ]
             mapping_df = mapping_df[[c for c in col_order if c in mapping_df.columns]]
 
-            # =====================================================
-            #   DASHBOARD LAYER (filters + KPIs + views)
-            # =====================================================
+            # ---------------- DASHBOARD -----------------
             st.subheader("Dashboard")
 
-            # filters
             f_col1, f_col2, f_col3 = st.columns(3)
 
             with f_col1:
                 min_date = mapping_df["Order Date"].min()
                 max_date = mapping_df["Order Date"].max()
                 date_range = st.date_input(
-                    "Filter: Order Date range",
+                    "Order Date range",
                     value=(min_date, max_date) if not pd.isna(min_date) else None,
                 )
 
             with f_col2:
                 sku_list = sorted(mapping_df["SKU"].dropna().unique().tolist())
-                sel_skus = st.multiselect(
-                    "Filter: SKU",
-                    options=sku_list,
-                )
+                sel_skus = st.multiselect("SKU filter", options=sku_list)
 
             with f_col3:
-                order_id_search = st.text_input("Filter: Order ID contains")
+                order_id_search = st.text_input("Order ID contains")
 
-            # apply filters
             df_filt = mapping_df.copy()
             if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
                 start, end = date_range
@@ -410,7 +408,6 @@ def main():
                     df_filt["Order ID"].astype(str).str.contains(order_id_search.strip(), case=False)
                 ]
 
-            # KPI cards – based on filtered data
             total_rows = df_filt.shape[0]
             unique_orders = df_filt["Order ID"].nunique()
             total_invoice = df_filt["Final Invoice Amount (Price after discount+Shipping Charges)"].sum()
@@ -431,14 +428,12 @@ def main():
             k6.metric("Not Reconciled Rows", not_reconciled_rows)
             k7.metric("Net Qty Diff", int(total_qty_diff))
 
-            # tabs for views
-            tab1, tab2, tab3 = st.tabs(["Final Table", "Qty Diff by SKU", "Raw Data"])
+            tab1, tab2, tab3 = st.tabs(["Final Table", "Qty Diff by SKU", "Raw Pivots"])
 
             with tab1:
                 st.dataframe(df_filt, use_container_width=True)
 
             with tab2:
-                # simple chart: total qty diff by SKU
                 df_chart = (
                     df_filt.groupby("SKU", as_index=False)["Qty_Diff (Settlement - Sale)"]
                     .sum()
@@ -469,6 +464,8 @@ def main():
 
         except Exception as e:
             st.error(f"Error: {e}")
+    else:
+        st.info("Upload both Settlement and Sale Report files to start reconciliation.")
 
 
 if __name__ == "__main__":
