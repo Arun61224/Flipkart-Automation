@@ -24,12 +24,8 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     if "Orders" not in xls.sheet_names:
         raise ValueError('Sheet named "Orders" not found in the uploaded file.')
 
-    # Sirf zaroori columns read karo (thoda fast)
-    orders = pd.read_excel(
-        bio,
-        sheet_name="Orders",
-        engine="openpyxl",
-    )
+    bio.seek(0)
+    orders = pd.read_excel(bio, sheet_name="Orders", engine="openpyxl")
 
     col_order_id = "Transaction Summary"          # H column -> Order ID
     col_bank_value = "Unnamed: 3"                 # D column -> Bank Settlement Value (Rs.)
@@ -104,7 +100,6 @@ def summarize_orders(df_clean: pd.DataFrame):
 
 @st.cache_data(show_spinner=False)
 def process_multiple_orders_cached(files_bytes_list):
-    """Heavy settlement processing – cached"""
     all_raw = []
     for fb in files_bytes_list:
         df_clean = process_orders_excel_from_bytes(fb)
@@ -148,6 +143,7 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
             f'Sale report sheet not found. Available sheets: {", ".join(xls.sheet_names)}'
         )
 
+    bio.seek(0)
     sales = pd.read_excel(bio, sheet_name=target_sheet, engine="openpyxl")
 
     # B: Order ID (OD...), F: SKU, N: Qty, H: Event
@@ -220,7 +216,6 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
 
 
 def summarize_sales(df: pd.DataFrame):
-    # remove only RETURN rows where same (Order ID, SKU, Qty) has both Sale & Return
     group_key = ["Order ID", "SKU", "Item Quantity"]
 
     def pair_flag(s):
@@ -271,7 +266,6 @@ def summarize_sales(df: pd.DataFrame):
 
 @st.cache_data(show_spinner=False)
 def process_multiple_sales_cached(files_bytes_list):
-    """Heavy sales processing – cached"""
     all_raw = []
     for fb in files_bytes_list:
         df_one = load_single_sales_df_from_bytes(fb)
@@ -283,7 +277,40 @@ def process_multiple_sales_cached(files_bytes_list):
 
 
 # ======================================================
-#   HELPER: FINAL REPORT → SINGLE SHEET EXCEL
+#   PART 3 – COST PRICE FILE (SKU, Cost Price)
+# ======================================================
+@st.cache_data(show_spinner=False)
+def process_cost_file_cached(file_bytes: bytes) -> pd.DataFrame:
+    bio = BytesIO(file_bytes)
+    # first sheet
+    df = pd.read_excel(bio, sheet_name=0, engine="openpyxl")
+
+    # find SKU column
+    sku_col = None
+    cost_col = None
+    for c in df.columns:
+        txt = str(c).lower()
+        if "sku" in txt and sku_col is None:
+            sku_col = c
+        if ("cost" in txt or "cost price" in txt or "cp" == txt) and cost_col is None:
+            cost_col = c
+
+    if sku_col is None:
+        raise ValueError("SKU column not found in Cost Price file.")
+    if cost_col is None:
+        raise ValueError("Cost Price column not found in Cost Price file.")
+
+    out = df[[sku_col, cost_col]].copy()
+    out["SKU"] = out[sku_col].astype(str).str.strip()
+    out["Cost Price"] = pd.to_numeric(out[cost_col], errors="coerce")
+
+    out = out[out["SKU"].notna() & out["Cost Price"].notna()]
+    out = out[["SKU", "Cost Price"]]
+    return out
+
+
+# ======================================================
+#   FINAL REPORT → SINGLE SHEET EXCEL
 # ======================================================
 def final_report_to_excel_bytes(df_mapping: pd.DataFrame):
     output = BytesIO()
@@ -304,7 +331,7 @@ def main():
 
     st.title("📊 Flipkart Reconciliation Dashboard")
 
-    col_up1, col_up2 = st.columns(2)
+    col_up1, col_up2, col_up3 = st.columns(3)
 
     with col_up1:
         settlement_files = st.file_uploader(
@@ -322,11 +349,18 @@ def main():
             accept_multiple_files=True,
         )
 
+    with col_up3:
+        cost_file = st.file_uploader(
+            "Upload SKU Cost Price file",
+            type=["xlsx", "xls"],
+            key="cost_file",
+            accept_multiple_files=False,
+        )
+
     st.markdown("---")
 
     if settlement_files and sales_files:
         try:
-            # bytes list banalo (cache-friendly)
             settlement_bytes_list = [f.getvalue() for f in settlement_files]
             sales_bytes_list = [f.getvalue() for f in sales_files]
 
@@ -340,7 +374,7 @@ def main():
                     sales_bytes_list
                 )
 
-            # ---- Final mapping: Sales → Settlement (same logic) ----
+            # ---- Final mapping: Sales → Settlement ----
             mapping_df = sales_pivot.merge(
                 orders_pivot[["Order ID", "Seller SKU", "Settlement_Qty", "Payment_Received"]],
                 left_on=["Order ID", "SKU"],
@@ -360,6 +394,23 @@ def main():
                 - mapping_df["Final Invoice Amount (Price after discount+Shipping Charges)"]
             )
 
+            # ---- Merge Cost Price (optional but recommended) ----
+            total_cost = 0.0
+            if cost_file is not None:
+                cost_bytes = cost_file.getvalue()
+                with st.spinner("Processing Cost Price file..."):
+                    cost_df = process_cost_file_cached(cost_bytes)
+
+                mapping_df = mapping_df.merge(cost_df, on="SKU", how="left")
+                mapping_df["Cost Price"] = mapping_df["Cost Price"].fillna(0.0)
+                mapping_df["Total Cost (Qty * Cost)"] = (
+                    mapping_df["Item Quantity"] * mapping_df["Cost Price"]
+                )
+                total_cost = mapping_df["Total Cost (Qty * Cost)"].sum()
+            else:
+                mapping_df["Cost Price"] = 0.0
+                mapping_df["Total Cost (Qty * Cost)"] = 0.0
+
             col_order = [
                 "Order Date",
                 "Order ID",
@@ -370,6 +421,8 @@ def main():
                 "Qty_Diff (Settlement - Sale)",
                 "Payment_Received",
                 "Amount_Diff (Settlement - Invoice)",
+                "Cost Price",
+                "Total Cost (Qty * Cost)",
             ]
             mapping_df = mapping_df[[c for c in col_order if c in mapping_df.columns]]
 
@@ -413,6 +466,7 @@ def main():
             total_invoice = df_filt["Final Invoice Amount (Price after discount+Shipping Charges)"].sum()
             total_payment = df_filt["Payment_Received"].sum()
             total_qty_diff = df_filt["Qty_Diff (Settlement - Sale)"].sum()
+            total_cost_filtered = df_filt["Total Cost (Qty * Cost)"].sum()
 
             reconciled_rows = df_filt[df_filt["Qty_Diff (Settlement - Sale)"] == 0].shape[0]
             not_reconciled_rows = total_rows - reconciled_rows
@@ -427,6 +481,10 @@ def main():
             k5.metric("Reconciled Rows (Qty=0)", reconciled_rows)
             k6.metric("Not Reconciled Rows", not_reconciled_rows)
             k7.metric("Net Qty Diff", int(total_qty_diff))
+
+            if cost_file is not None:
+                k8, _ = st.columns(2)
+                k8.metric("Total Cost (filtered)", f"{total_cost_filtered:,.2f}")
 
             tab1, tab2, tab3 = st.tabs(["Final Table", "Qty Diff by SKU", "Raw Pivots"])
 
@@ -465,7 +523,7 @@ def main():
         except Exception as e:
             st.error(f"Error: {e}")
     else:
-        st.info("Upload both Settlement and Sale Report files to start reconciliation.")
+        st.info("Upload Settlement, Sale Report and (optional) Cost Price file to start reconciliation.")
 
 
 if __name__ == "__main__":
