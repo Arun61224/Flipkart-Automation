@@ -172,34 +172,58 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     if col_order_date is None:
         raise ValueError("Could not find 'Order Date' column in Sale Report.")
 
-    # Final Invoice Amount
+    # Invoice Amount (original long name)
     col_invoice = None
+    # Price before discount column
+    col_price_before_disc = None
+
     for c in sales.columns:
         txt = str(c).lower()
-        if "final invoice amount" in txt or "price after discount" in txt:
+        if (
+            "final invoice amount" in txt
+            or "price after discount" in txt
+            or "invoice amount" in txt
+        ):
             col_invoice = c
-            break
+        if "price before discount" in txt:
+            col_price_before_disc = c
+
     if col_invoice is None:
         raise ValueError(
-            "Could not find 'Final Invoice Amount (Price after discount+Shipping Charges)' column."
+            "Could not find 'Final Invoice Amount (Price after discount+Shipping Charges)' / Invoice Amount column."
         )
 
-    df = sales[[col_order_date, col_order, col_sku, col_qty, col_event, col_invoice]].copy()
+    df = sales[
+        [
+            col_order_date,
+            col_order,
+            col_sku,
+            col_qty,
+            col_event,
+            col_invoice,
+        ]
+        + ([col_price_before_disc] if col_price_before_disc is not None else [])
+    ].copy()
 
     df["Order Date"] = pd.to_datetime(df[col_order_date], errors="coerce")
     df["Order ID"] = df[col_order].astype(str).str.strip()
     df["SKU"] = df[col_sku].apply(clean_sku_text)
     df["Item Quantity"] = pd.to_numeric(df[col_qty], errors="coerce")
     df["Event"] = df[col_event].astype(str).str.strip()
-    df["Final Invoice Amount (Price after discount+Shipping Charges)"] = pd.to_numeric(
-        df[col_invoice], errors="coerce"
-    )
+    df["Invoice Amount"] = pd.to_numeric(df[col_invoice], errors="coerce")
+
+    if col_price_before_disc is not None:
+        df["Price Before Discount"] = pd.to_numeric(
+            df[col_price_before_disc], errors="coerce"
+        )
+    else:
+        df["Price Before Discount"] = pd.NA
 
     df = df[
         df["Order ID"].notna()
         & df["SKU"].notna()
         & df["Item Quantity"].notna()
-        & df["Final Invoice Amount (Price after discount+Shipping Charges)"].notna()
+        & df["Invoice Amount"].notna()
         & df["Event"].notna()
     ]
 
@@ -209,7 +233,8 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
             "Order ID",
             "SKU",
             "Item Quantity",
-            "Final Invoice Amount (Price after discount+Shipping Charges)",
+            "Invoice Amount",
+            "Price Before Discount",
             "Event",
         ]
     ]
@@ -217,11 +242,9 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
 
 def summarize_sales(df: pd.DataFrame):
     """
-    NEW LOGIC:
+    Returns logic (simple):
     - saari 'Return' rows hata do
-    - baaki (Sale, etc.) pe pivot banao
     """
-    # drop all returns
     df_clean = df[~df["Event"].str.lower().eq("return")].copy()
 
     sales_pivot = (
@@ -229,16 +252,15 @@ def summarize_sales(df: pd.DataFrame):
         .agg(
             Order_Date=("Order Date", "min"),
             Item_Quantity=("Item Quantity", "sum"),
-            Final_Invoice_Amount=(
-                "Final Invoice Amount (Price after discount+Shipping Charges)",
-                "sum",
-            ),
+            Invoice_Amount=("Invoice Amount", "sum"),
+            Price_Before_Discount=("Price Before Discount", "sum"),
         )
         .rename(
             columns={
                 "Order_Date": "Order Date",
                 "Item_Quantity": "Item Quantity",
-                "Final_Invoice_Amount": "Final Invoice Amount (Price after discount+Shipping Charges)",
+                "Invoice_Amount": "Invoice Amount",
+                "Price_Before_Discount": "Price Before Discount",
             }
         )
     )
@@ -248,9 +270,7 @@ def summarize_sales(df: pd.DataFrame):
         "total_unique_sku": df_clean["SKU"].nunique(),
         "total_rows": df_clean.shape[0],
         "grand_sale_qty": df_clean["Item Quantity"].sum(),
-        "grand_invoice_amount": df_clean[
-            "Final Invoice Amount (Price after discount+Shipping Charges)"
-        ].sum(),
+        "grand_invoice_amount": df_clean["Invoice Amount"].sum(),
     }
 
     return df_clean, sales_pivot, summary
@@ -321,31 +341,29 @@ def main():
 
     st.title("📊 Flipkart Reconciliation Dashboard")
 
-    col_up1, col_up2, col_up3 = st.columns(3)
+    # ---------- Sidebar uploads ----------
+    st.sidebar.header("Upload Files")
 
-    with col_up1:
-        settlement_files = st.file_uploader(
-            "Upload Settlement Excel file(s)",
-            type=["xlsx", "xls"],
-            key="settlement_files",
-            accept_multiple_files=True,
-        )
+    settlement_files = st.sidebar.file_uploader(
+        "Settlement Excel file(s)",
+        type=["xlsx", "xls"],
+        key="settlement_files",
+        accept_multiple_files=True,
+    )
 
-    with col_up2:
-        sales_files = st.file_uploader(
-            "Upload Sale Report Excel file(s)",
-            type=["xlsx", "xls"],
-            key="sales_files",
-            accept_multiple_files=True,
-        )
+    sales_files = st.sidebar.file_uploader(
+        "Sale Report Excel file(s)",
+        type=["xlsx", "xls"],
+        key="sales_files",
+        accept_multiple_files=True,
+    )
 
-    with col_up3:
-        cost_file = st.file_uploader(
-            "Upload SKU Cost Price file",
-            type=["xlsx", "xls"],
-            key="cost_file",
-            accept_multiple_files=False,
-        )
+    cost_file = st.sidebar.file_uploader(
+        "SKU Cost Price file",
+        type=["xlsx", "xls"],
+        key="cost_file",
+        accept_multiple_files=False,
+    )
 
     st.markdown("---")
 
@@ -379,10 +397,19 @@ def main():
             mapping_df["Qty_Diff (Settlement - Sale)"] = (
                 mapping_df["Settlement_Qty"] - mapping_df["Item Quantity"]
             )
+
+            # Amount diff based on new Invoice Amount
             mapping_df["Amount_Diff (Settlement - Invoice)"] = (
-                mapping_df["Payment_Received"]
-                - mapping_df["Final Invoice Amount (Price after discount+Shipping Charges)"]
+                mapping_df["Payment_Received"] - mapping_df["Invoice Amount"]
             )
+
+            # ---- New column: Payment received agaist this Amount (Price Before Discount) ----
+            if "Price Before Discount" in mapping_df.columns:
+                mapping_df["Payment received agaist this Amount"] = mapping_df[
+                    "Price Before Discount"
+                ]
+            else:
+                mapping_df["Payment received agaist this Amount"] = 0.0
 
             # ---- Merge Cost Price ----
             if cost_file is not None:
@@ -399,12 +426,14 @@ def main():
                 mapping_df["Cost Price"] = 0.0
                 mapping_df["Total Cost (Qty * Cost)"] = 0.0
 
+            # Final columns order (Invoice Amount short name + new column)
             col_order = [
                 "Order Date",
                 "Order ID",
                 "SKU",
                 "Item Quantity",
-                "Final Invoice Amount (Price after discount+Shipping Charges)",
+                "Invoice Amount",
+                "Payment received agaist this Amount",
                 "Settlement_Qty",
                 "Qty_Diff (Settlement - Sale)",
                 "Payment_Received",
@@ -451,7 +480,7 @@ def main():
 
             total_rows = df_filt.shape[0]
             unique_orders = df_filt["Order ID"].nunique()
-            total_invoice = df_filt["Final Invoice Amount (Price after discount+Shipping Charges)"].sum()
+            total_invoice = df_filt["Invoice Amount"].sum()
             total_payment = df_filt["Payment_Received"].sum()
             total_qty_diff = df_filt["Qty_Diff (Settlement - Sale)"].sum()
             total_cost_filtered = df_filt["Total Cost (Qty * Cost)"].sum()
@@ -511,7 +540,7 @@ def main():
         except Exception as e:
             st.error(f"Error: {e}")
     else:
-        st.info("Upload Settlement, Sale Report and (optional) Cost Price file to start reconciliation.")
+        st.info("Upload Settlement, Sale Report and (optional) Cost Price file in sidebar to start reconciliation.")
 
 
 if __name__ == "__main__":
