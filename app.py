@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 
+# -----------------------
+# Excel column name -> index (A=0, BG=58 etc.)
+# -----------------------
 def excel_col_to_idx(col_name: str) -> int:
     col_name = col_name.strip().upper()
     idx = 0
@@ -10,7 +13,8 @@ def excel_col_to_idx(col_name: str) -> int:
             idx = idx * 26 + (ord(c) - ord("A") + 1)
     return idx - 1
 
-# ---------------- SETTLEMENT FILE ----------------
+
+# ========================= SETTLEMENT FILE =========================
 def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     bio = BytesIO(file_bytes)
     xls = pd.ExcelFile(bio)
@@ -21,8 +25,8 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     bio.seek(0)
     orders = pd.read_excel(bio, sheet_name="Orders", engine="openpyxl")
 
-    col_order_id = "Transaction Summary"
-    col_bank_value = "Unnamed: 3"
+    col_order_id = "Transaction Summary"   # H
+    col_bank_value = "Unnamed: 3"          # D
 
     sku_idx = excel_col_to_idx("BG")
     qty_idx = excel_col_to_idx("BH")
@@ -31,6 +35,7 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
 
     df = orders.copy()
     df = df[df[col_order_id].astype(str).str.startswith("OD", na=False)]
+
     df[col_bank_value] = pd.to_numeric(df[col_bank_value], errors="coerce")
     df[col_qty] = pd.to_numeric(df[col_qty], errors="coerce")
 
@@ -50,6 +55,7 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
         }
     )
 
+
 def summarize_orders(df):
     pivot = (
         df.groupby(["Order ID", "Seller SKU"], as_index=False)
@@ -60,13 +66,15 @@ def summarize_orders(df):
     )
     return pivot
 
-@st.cache_data
+
+@st.cache_data(show_spinner=False)
 def process_multiple_orders_cached(files_bytes_list):
     all_raw = [process_orders_excel_from_bytes(f) for f in files_bytes_list]
     raw = pd.concat(all_raw, ignore_index=True)
     return raw, summarize_orders(raw)
 
-# ---------------- SALES REPORT ----------------
+
+# ========================= SALES REPORT =========================
 def clean_sku_text(v):
     if pd.isna(v):
         return None
@@ -75,10 +83,12 @@ def clean_sku_text(v):
         s = s[4:]
     return s.strip()
 
+
 def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     bio = BytesIO(file_bytes)
     xls = pd.ExcelFile(bio)
 
+    # sheet detect (contains sale + report)
     target_sheet = None
     for s in xls.sheet_names:
         chk = s.lower().replace(" ", "")
@@ -91,6 +101,7 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     bio.seek(0)
     sales = pd.read_excel(bio, sheet_name=target_sheet, engine="openpyxl")
 
+    # B: Order ID, F: SKU, N: Qty, H: Event
     order_idx = excel_col_to_idx("B")
     sku_idx = excel_col_to_idx("F")
     qty_idx = excel_col_to_idx("N")
@@ -101,32 +112,60 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     col_qty = sales.columns[qty_idx]
     col_event = sales.columns[event_idx]
 
+    # Order Date column
     col_order_date = [c for c in sales.columns if "order date" in c.lower()][0]
-    col_invoice = [c for c in sales.columns if "final invoice amount" in c.lower()][0]
+
+    # Final Invoice Amount (Price after discount+Shipping Charges)
+    col_invoice = [
+        c for c in sales.columns if "final invoice amount" in c.lower()
+    ][0]
+
+    # Price before discount
     col_price_before = None
     for c in sales.columns:
         if "price before discount" in c.lower():
             col_price_before = c
+            break
 
     cols = [col_order_date, col_order, col_sku, col_qty, col_event, col_invoice]
     if col_price_before:
         cols.append(col_price_before)
 
     df = sales[cols].copy()
+
     df["Order Date"] = pd.to_datetime(df[col_order_date], errors="coerce")
     df["Order ID"] = df[col_order].astype(str).str.strip()
     df["SKU"] = df[col_sku].apply(clean_sku_text)
     df["Item Quantity"] = pd.to_numeric(df[col_qty], errors="coerce")
     df["Event"] = df[col_event].astype(str)
+
+    # yahi se ORIGINAL long column se Invoice Amount bana rahe
     df["Invoice Amount"] = pd.to_numeric(df[col_invoice], errors="coerce")
-    df["Price Before Discount"] = (
-        pd.to_numeric(df[col_price_before], errors="coerce")
-        if col_price_before else 0
-    )
-    df = df[df["Event"].str.lower() != "return"]   # remove all returns
-    return df[["Order Date", "Order ID", "SKU", "Item Quantity", "Invoice Amount", "Price Before Discount"]]
+
+    if col_price_before:
+        df["Price Before Discount"] = pd.to_numeric(
+            df[col_price_before], errors="coerce"
+        )
+    else:
+        df["Price Before Discount"] = 0
+
+    # saari Return rows hata do
+    df = df[df["Event"].str.lower() != "return"]
+
+    return df[
+        [
+            "Order Date",
+            "Order ID",
+            "SKU",
+            "Item Quantity",
+            "Invoice Amount",
+            "Price Before Discount",
+        ]
+    ]
+
 
 def summarize_sales(df):
+    # ab yahan aggregate karke naam proper rakh rahe hain
     pivot = (
         df.groupby(["Order ID", "SKU"], as_index=False)
         .agg(
@@ -135,77 +174,125 @@ def summarize_sales(df):
             Invoice_Amount=("Invoice Amount", "sum"),
             Price_Before_Discount=("Price Before Discount", "sum"),
         )
+        .rename(
+            columns={
+                "Order_Date": "Order Date",
+                "Item_Quantity": "Item Quantity",
+                "Invoice_Amount": "Invoice Amount",
+                "Price_Before_Discount": "Price Before Discount",
+            }
+        )
     )
     return pivot
 
-@st.cache_data
+
+@st.cache_data(show_spinner=False)
 def process_multiple_sales_cached(files_bytes_list):
     all_raw = [load_single_sales_df_from_bytes(f) for f in files_bytes_list]
     raw = pd.concat(all_raw, ignore_index=True)
     return raw, summarize_sales(raw)
 
-# ---------------- COST FILE ----------------
-@st.cache_data
+
+# ========================= COST FILE =========================
+@st.cache_data(show_spinner=False)
 def process_cost_file_cached(file_bytes):
     bio = BytesIO(file_bytes)
     df = pd.read_excel(bio, engine="openpyxl")
+
     sku = [c for c in df.columns if "sku" in c.lower()][0]
     cost = [c for c in df.columns if "cost" in c.lower()][0]
+
     out = df[[sku, cost]].copy()
     out["SKU"] = out[sku].astype(str)
     out["Cost Price"] = pd.to_numeric(out[cost], errors="coerce")
     return out[["SKU", "Cost Price"]]
 
-# ---------------- EXPORT TO EXCEL ----------------
+
+# ========================= EXPORT TO EXCEL =========================
 def final_report_to_excel_bytes(df):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="Final_Mapped_Report")
     return output.getvalue()
 
-# ======================================================
-#   STREAMLIT APP
-# ======================================================
+
+# ========================= STREAMLIT APP =========================
 def main():
-    st.set_page_config(page_title="Flipkart Reconciliation", page_icon="📊", layout="wide")
+    st.set_page_config(
+        page_title="Flipkart Reconciliation",
+        page_icon="📊",
+        layout="wide",
+    )
     st.title("📊 Flipkart Reconciliation Tool")
 
+    # Sidebar uploads
     st.sidebar.header("Upload Files")
-    settlement_files = st.sidebar.file_uploader("Settlement Excel file(s)", type=["xlsx","xls"], accept_multiple_files=True)
-    sales_files = st.sidebar.file_uploader("Sale Report Excel file(s)", type=["xlsx","xls"], accept_multiple_files=True)
-    cost_file = st.sidebar.file_uploader("SKU Cost Price file", type=["xlsx","xls"])
+    settlement_files = st.sidebar.file_uploader(
+        "Settlement Excel file(s)",
+        type=["xlsx", "xls"],
+        accept_multiple_files=True,
+    )
+    sales_files = st.sidebar.file_uploader(
+        "Sale Report Excel file(s)",
+        type=["xlsx", "xls"],
+        accept_multiple_files=True,
+    )
+    cost_file = st.sidebar.file_uploader(
+        "SKU Cost Price file",
+        type=["xlsx", "xls"],
+    )
 
     st.markdown("---")
 
     if settlement_files and sales_files:
         try:
-            raw_set, pivot_set = process_multiple_orders_cached([f.getvalue() for f in settlement_files])
-            raw_sale, pivot_sale = process_multiple_sales_cached([f.getvalue() for f in sales_files])
+            raw_set, pivot_set = process_multiple_orders_cached(
+                [f.getvalue() for f in settlement_files]
+            )
+            raw_sale, pivot_sale = process_multiple_sales_cached(
+                [f.getvalue() for f in sales_files]
+            )
 
+            # Map Sales -> Settlement
             mapping = pivot_sale.merge(
                 pivot_set[["Order ID", "Seller SKU", "Settlement_Qty", "Payment_Received"]],
                 left_on=["Order ID", "SKU"],
                 right_on=["Order ID", "Seller SKU"],
-                how="left"
+                how="left",
             )
+
             mapping = mapping.drop(columns=["Seller SKU"])
             mapping["Settlement_Qty"] = mapping["Settlement_Qty"].fillna(0)
             mapping["Payment_Received"] = mapping["Payment_Received"].fillna(0)
-            mapping["Qty_Diff (Settlement - Sale)"] = mapping["Settlement_Qty"] - mapping["Item Quantity"]
-            mapping["Amount_Diff (Settlement - Invoice)"] = mapping["Payment_Received"] - mapping["Invoice Amount"]
 
-            mapping["Payment received agaist this Amount"] = mapping["Price Before Discount"]
+            # Qty diff (calculation ke liye)
+            mapping["Qty_Diff (Settlement - Sale)"] = (
+                mapping["Settlement_Qty"] - mapping["Item Quantity"]
+            )
 
+            # Amount diff calculation BACKEND (report me nahi dikhana)
+            mapping["Amount_Diff (Settlement - Invoice)"] = (
+                mapping["Payment_Received"] - mapping["Invoice Amount"]
+            )
+
+            # naya column: Payment received agaist this Amount = Price Before Discount
+            mapping["Payment received agaist this Amount"] = mapping[
+                "Price Before Discount"
+            ]
+
+            # Cost file merge
             if cost_file:
                 cost = process_cost_file_cached(cost_file.getvalue())
                 mapping = mapping.merge(cost, on="SKU", how="left")
                 mapping["Cost Price"] = mapping["Cost Price"].fillna(0)
-                mapping["Total Cost (Qty * Cost)"] = mapping["Item Quantity"] * mapping["Cost Price"]
+                mapping["Total Cost (Qty * Cost)"] = (
+                    mapping["Item Quantity"] * mapping["Cost Price"]
+                )
             else:
                 mapping["Cost Price"] = 0
                 mapping["Total Cost (Qty * Cost)"] = 0
 
-            # 🚨 remove J column from report + excel (ignore in output)
+            # FINAL columns (yahan J column include NHI hai)
             col_final = [
                 "Order Date",
                 "Order ID",
@@ -221,8 +308,10 @@ def main():
             ]
             mapping = mapping[col_final]
 
+            # View
             st.dataframe(mapping, use_container_width=True)
 
+            # Download
             excel_bytes = final_report_to_excel_bytes(mapping)
             st.download_button(
                 "Download Final Mapped Report",
@@ -233,9 +322,9 @@ def main():
 
         except Exception as e:
             st.error(f"Error: {e}")
-
     else:
         st.info("Upload Settlement + Sales Report to start.")
+
 
 if __name__ == "__main__":
     main()
