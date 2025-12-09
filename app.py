@@ -64,14 +64,22 @@ def summarize_orders(df):
             Payment_Received=("Payment Received", "sum"),
         )
     )
-    return pivot
+    summary = {
+        "rows": df.shape[0],
+        "orders": df["Order ID"].nunique(),
+        "skus": df["Seller SKU"].nunique(),
+        "qty": df["Settlement Qty"].sum(),
+        "payment": df["Payment Received"].sum(),
+    }
+    return pivot, summary
 
 
 @st.cache_data(show_spinner=False)
 def process_multiple_orders_cached(files_bytes_list):
     all_raw = [process_orders_excel_from_bytes(f) for f in files_bytes_list]
     raw = pd.concat(all_raw, ignore_index=True)
-    return raw, summarize_orders(raw)
+    pivot, summary = summarize_orders(raw)
+    return raw, pivot, summary
 
 
 # ========================= SALES REPORT =========================
@@ -165,7 +173,6 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
 
 
 def summarize_sales(df):
-    # ab yahan aggregate karke naam proper rakh rahe hain
     pivot = (
         df.groupby(["Order ID", "SKU"], as_index=False)
         .agg(
@@ -183,14 +190,22 @@ def summarize_sales(df):
             }
         )
     )
-    return pivot
+    summary = {
+        "rows": df.shape[0],
+        "orders": df["Order ID"].nunique(),
+        "skus": df["SKU"].nunique(),
+        "qty": df["Item Quantity"].sum(),
+        "invoice": df["Invoice Amount"].sum(),
+    }
+    return pivot, summary
 
 
 @st.cache_data(show_spinner=False)
 def process_multiple_sales_cached(files_bytes_list):
     all_raw = [load_single_sales_df_from_bytes(f) for f in files_bytes_list]
     raw = pd.concat(all_raw, ignore_index=True)
-    return raw, summarize_sales(raw)
+    pivot, summary = summarize_sales(raw)
+    return raw, pivot, summary
 
 
 # ========================= COST FILE =========================
@@ -219,13 +234,13 @@ def final_report_to_excel_bytes(df):
 # ========================= STREAMLIT APP =========================
 def main():
     st.set_page_config(
-        page_title="Flipkart Reconciliation",
+        page_title="Flipkart Reconciliation Tool",
         page_icon="📊",
         layout="wide",
     )
     st.title("📊 Flipkart Reconciliation Tool")
 
-    # Sidebar uploads
+    # ---------- Sidebar uploads ----------
     st.sidebar.header("Upload Files")
     settlement_files = st.sidebar.file_uploader(
         "Settlement Excel file(s)",
@@ -246,14 +261,15 @@ def main():
 
     if settlement_files and sales_files:
         try:
-            raw_set, pivot_set = process_multiple_orders_cached(
+            # -------- Process files --------
+            raw_set, pivot_set, set_summary = process_multiple_orders_cached(
                 [f.getvalue() for f in settlement_files]
             )
-            raw_sale, pivot_sale = process_multiple_sales_cached(
+            raw_sale, pivot_sale, sale_summary = process_multiple_sales_cached(
                 [f.getvalue() for f in sales_files]
             )
 
-            # Map Sales -> Settlement
+            # -------- Mapping --------
             mapping = pivot_sale.merge(
                 pivot_set[["Order ID", "Seller SKU", "Settlement_Qty", "Payment_Received"]],
                 left_on=["Order ID", "SKU"],
@@ -265,22 +281,21 @@ def main():
             mapping["Settlement_Qty"] = mapping["Settlement_Qty"].fillna(0)
             mapping["Payment_Received"] = mapping["Payment_Received"].fillna(0)
 
-            # Qty diff (calculation ke liye)
             mapping["Qty_Diff (Settlement - Sale)"] = (
                 mapping["Settlement_Qty"] - mapping["Item Quantity"]
             )
 
-            # Amount diff calculation BACKEND (report me nahi dikhana)
+            # Amount diff calculation (backend only – report me nahi dikhate)
             mapping["Amount_Diff (Settlement - Invoice)"] = (
                 mapping["Payment_Received"] - mapping["Invoice Amount"]
             )
 
-            # naya column: Payment received agaist this Amount = Price Before Discount
+            # Payment received agaist this Amount = Price Before Discount
             mapping["Payment received agaist this Amount"] = mapping[
                 "Price Before Discount"
             ]
 
-            # Cost file merge
+            # Cost merge
             if cost_file:
                 cost = process_cost_file_cached(cost_file.getvalue())
                 mapping = mapping.merge(cost, on="SKU", how="left")
@@ -292,7 +307,31 @@ def main():
                 mapping["Cost Price"] = 0
                 mapping["Total Cost (Qty * Cost)"] = 0
 
-            # FINAL columns (yahan J column include NHI hai)
+            # -------- Summary (upar detail) --------
+            st.subheader("Summary")
+
+            total_rows = mapping.shape[0]
+            unique_orders = mapping["Order ID"].nunique()
+            unique_skus = mapping["SKU"].nunique()
+            total_invoice = mapping["Invoice Amount"].sum()
+            total_payment = mapping["Payment_Received"].sum()
+            total_qty_diff = mapping["Qty_Diff (Settlement - Sale)"].sum()
+            total_cost = mapping["Total Cost (Qty * Cost)"].sum()
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Rows (Order + SKU)", total_rows)
+            c2.metric("Unique Orders", unique_orders)
+            c3.metric("Unique SKUs", unique_skus)
+            c4.metric("Net Qty Diff", int(total_qty_diff))
+
+            c5, c6, c7 = st.columns(3)
+            c5.metric("Total Invoice Amount", f"{total_invoice:,.2f}")
+            c6.metric("Total Settlement Payment", f"{total_payment:,.2f}")
+            c7.metric("Total Cost (Qty * Cost)", f"{total_cost:,.2f}")
+
+            st.markdown("---")
+
+            # -------- Final view (J column removed) --------
             col_final = [
                 "Order Date",
                 "Order ID",
@@ -306,13 +345,15 @@ def main():
                 "Cost Price",
                 "Total Cost (Qty * Cost)",
             ]
-            mapping = mapping[col_final]
+            mapping_view = mapping[col_final]
 
-            # View
-            st.dataframe(mapping, use_container_width=True)
+            st.subheader("Final Mapped Report")
+            st.dataframe(mapping_view, use_container_width=True)
 
-            # Download
-            excel_bytes = final_report_to_excel_bytes(mapping)
+            # -------- Download Excel --------
+            st.markdown("---")
+            st.subheader("Download")
+            excel_bytes = final_report_to_excel_bytes(mapping_view)
             st.download_button(
                 "Download Final Mapped Report",
                 data=excel_bytes,
@@ -323,7 +364,7 @@ def main():
         except Exception as e:
             st.error(f"Error: {e}")
     else:
-        st.info("Upload Settlement + Sales Report to start.")
+        st.info("Upload Settlement & Sales Report files from the sidebar to start reconciliation.")
 
 
 if __name__ == "__main__":
