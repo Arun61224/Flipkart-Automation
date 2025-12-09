@@ -182,7 +182,6 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
         if (
             "final invoice amount" in txt
             or "price after discount" in txt
-            or "invoice amount" in txt
         ):
             col_invoice = c
         if "price before discount" in txt:
@@ -190,26 +189,29 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
 
     if col_invoice is None:
         raise ValueError(
-            "Could not find 'Final Invoice Amount (Price after discount+Shipping Charges)' / Invoice Amount column."
+            "Could not find 'Final Invoice Amount (Price after discount+Shipping Charges)' column."
         )
 
-    df = sales[
-        [
-            col_order_date,
-            col_order,
-            col_sku,
-            col_qty,
-            col_event,
-            col_invoice,
-        ]
-        + ([col_price_before_disc] if col_price_before_disc is not None else [])
-    ].copy()
+    cols_to_take = [
+        col_order_date,
+        col_order,
+        col_sku,
+        col_qty,
+        col_event,
+        col_invoice,
+    ]
+    if col_price_before_disc is not None:
+        cols_to_take.append(col_price_before_disc)
+
+    df = sales[cols_to_take].copy()
 
     df["Order Date"] = pd.to_datetime(df[col_order_date], errors="coerce")
     df["Order ID"] = df[col_order].astype(str).str.strip()
     df["SKU"] = df[col_sku].apply(clean_sku_text)
     df["Item Quantity"] = pd.to_numeric(df[col_qty], errors="coerce")
     df["Event"] = df[col_event].astype(str).str.strip()
+
+    # yahi se original column se value leke short naam create kar rahe
     df["Invoice Amount"] = pd.to_numeric(df[col_invoice], errors="coerce")
 
     if col_price_before_disc is not None:
@@ -242,8 +244,9 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
 
 def summarize_sales(df: pd.DataFrame):
     """
-    Returns logic (simple):
+    Logic:
     - saari 'Return' rows hata do
+    - baaki pe Invoice Amount + Price Before Discount aggregate
     """
     df_clean = df[~df["Event"].str.lower().eq("return")].copy()
 
@@ -398,7 +401,7 @@ def main():
                 mapping_df["Settlement_Qty"] - mapping_df["Item Quantity"]
             )
 
-            # Amount diff based on new Invoice Amount
+            # Amount diff based on Invoice Amount
             mapping_df["Amount_Diff (Settlement - Invoice)"] = (
                 mapping_df["Payment_Received"] - mapping_df["Invoice Amount"]
             )
@@ -426,7 +429,7 @@ def main():
                 mapping_df["Cost Price"] = 0.0
                 mapping_df["Total Cost (Qty * Cost)"] = 0.0
 
-            # Final columns order (Invoice Amount short name + new column)
+            # Final columns order
             col_order = [
                 "Order Date",
                 "Order ID",
