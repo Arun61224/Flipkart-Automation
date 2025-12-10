@@ -26,7 +26,6 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     bio.seek(0)
     orders = pd.read_excel(bio, sheet_name="Orders", engine="openpyxl")
 
-    # Expected headers inside Orders sheet
     col_order_id = "Transaction Summary"   # H column header in sample
     col_bank_value = "Unnamed: 3"          # D column (Bank Settlement Value (Rs.)) in sample
 
@@ -184,7 +183,6 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     # ---------- NEW: convert Return rows to NEGATIVE values instead of removing ----------
     df["IsReturn"] = df["Event"].str.lower().eq("return")
 
-    # if IsReturn True, multiply relevant numeric fields by -1
     df.loc[df["IsReturn"], "Item Quantity"] = df.loc[df["IsReturn"], "Item Quantity"] * -1
     df.loc[df["IsReturn"], "Invoice Amount"] = df.loc[df["IsReturn"], "Invoice Amount"] * -1
     df.loc[df["IsReturn"], "Price Before Discount"] = df.loc[df["IsReturn"], "Price Before Discount"] * -1
@@ -312,6 +310,7 @@ def main():
                 right_on=["Order ID", "Seller SKU"],
                 how="left",
             )
+
             # clean and fillna
             mapping = mapping.drop(columns=["Seller SKU"], errors="ignore")
             mapping["Settlement_Qty"] = mapping["Settlement_Qty"].fillna(0)
@@ -320,21 +319,42 @@ def main():
             # Qty diff (calculation - can be negative/positive)
             mapping["Qty_Diff (Settlement - Sale)"] = mapping["Settlement_Qty"] - mapping["Item Quantity"]
 
-            # Amount diff CALCULATION (keep in backend but NOT show in final)
+            # Amount diff CALCULATION (backend only – not shown)
             mapping["Amount_Diff (Settlement - Invoice)"] = mapping["Payment_Received"] - mapping["Invoice Amount"]
 
-            # Payment received against this Amount = aggregated Price Before Discount (we already have aggregated column)
+            # Payment received against this Amount = aggregated Price Before Discount
             mapping["Payment received agaist this Amount"] = mapping["Price Before Discount"]
 
             # Merge cost file if provided
             if cost_file is not None:
                 cost_df = process_cost_file_cached(cost_file.getvalue())
                 mapping = mapping.merge(cost_df, on="SKU", how="left")
+                # if cost missing, set 0 to avoid NaN
                 mapping["Cost Price"] = mapping["Cost Price"].fillna(0.0)
-                mapping["Total Cost (Qty * Cost)"] = mapping["Item Quantity"] * mapping["Cost Price"]
             else:
                 mapping["Cost Price"] = 0.0
-                mapping["Total Cost (Qty * Cost)"] = 0.0
+
+            # ---------------- NEW: Adjust Cost Price based on rules ----------------
+            # Rules:
+            # - If return entry (Item Quantity < 0) -> use 50% of Cost Price
+            # - If Item Quantity == 0 -> use 20% of Cost Price
+            # - Else normal sale -> 100% Cost Price
+            mapping["Cost Price Adjusted"] = mapping["Cost Price"]  # default
+
+            # Apply return rule (50%)
+            mask_return = mapping["Item Quantity"] < 0
+            mapping.loc[mask_return, "Cost Price Adjusted"] = mapping.loc[mask_return, "Cost Price"] * 0.5
+
+            # Apply zero-qty rule (20%)
+            mask_zero = mapping["Item Quantity"] == 0
+            mapping.loc[mask_zero, "Cost Price Adjusted"] = mapping.loc[mask_zero, "Cost Price"] * 0.2
+
+            # Total Cost uses adjusted price
+            mapping["Total Cost (Qty * Adjusted Cost)"] = mapping["Item Quantity"] * mapping["Cost Price Adjusted"]
+
+            # Keep original Total Cost column name compatibility (optional)
+            # Replace previous "Total Cost (Qty * Cost)" with adjusted version
+            mapping["Total Cost (Qty * Cost)"] = mapping["Total Cost (Qty * Adjusted Cost)"]
 
             # ---------- Summary / top metrics ----------
             st.subheader("Summary")
@@ -355,11 +375,11 @@ def main():
             c5, c6, c7 = st.columns(3)
             c5.metric("Total Invoice Amount", f"{total_invoice:,.2f}")
             c6.metric("Total Settlement Payment", f"{total_payment:,.2f}")
-            c7.metric("Total Cost (Qty * Cost)", f"{total_cost:,.2f}")
+            c7.metric("Total Cost (adjusted, filtered)", f"{total_cost:,.2f}")
 
             st.markdown("---")
 
-            # ---------- Build final view (HIDE Amount_Diff column J) ----------
+            # ---------- Build final view (don't show backend-only columns) ----------
             final_cols = [
                 "Order Date",
                 "Order ID",
@@ -370,9 +390,11 @@ def main():
                 "Settlement_Qty",
                 "Qty_Diff (Settlement - Sale)",
                 "Payment_Received",
-                "Cost Price",
-                "Total Cost (Qty * Cost)",
+                "Cost Price",                # original cost price
+                "Cost Price Adjusted",       # show adjusted for clarity
+                "Total Cost (Qty * Cost)",   # adjusted total cost (kept name for compatibility)
             ]
+            # ensure only existing cols used
             mapping_view = mapping[[c for c in final_cols if c in mapping.columns]].copy()
 
             st.subheader("Final Mapped Report")
