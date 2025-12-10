@@ -26,8 +26,8 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     bio.seek(0)
     orders = pd.read_excel(bio, sheet_name="Orders", engine="openpyxl")
 
-    col_order_id = "Transaction Summary"
-    col_bank_value = "Unnamed: 3"
+    col_order_id = "Transaction Summary"   # H column header in sample
+    col_bank_value = "Unnamed: 3"          # D column (Bank Settlement Value (Rs.)) in sample
 
     if col_order_id not in orders.columns or col_bank_value not in orders.columns:
         raise ValueError(
@@ -355,38 +355,31 @@ def main():
                 "MAC": 0.10,
             }
 
-            # Compute royalty per prefix (only positive net invoice considered)
-            royalty_breakdown = {}
+            # Compute total royalty (consolidated) across all prefixes (only positive net considered per prefix)
+            total_royalty = 0.0
+            royalty_details = {}
             for prefix, rate in royalty_rules.items():
                 mask = mapping["SKU"].astype(str).str.upper().str.startswith(prefix)
                 net_invoice = mapping.loc[mask, "Invoice Amount"].sum()
                 net_positive = net_invoice if net_invoice > 0 else 0.0
                 royalty_amount = net_positive * rate
-                royalty_breakdown[prefix] = {"net_invoice": net_invoice, "royalty": royalty_amount, "rate": rate}
+                royalty_details[prefix] = {"net_invoice": net_invoice, "royalty": royalty_amount, "rate": rate}
+                total_royalty += royalty_amount
 
-            # Display royalty metrics (grouped nicely)
-            st.markdown("")  # spacing
-            st.write("### Royalty Summary (dashboard only)")
-            cols = st.columns(3)
-            i = 0
-            # For nicer ordering show Marvel/Disney as combined label for MKUC/DKUC
-            # We'll show MKUC and DKUC separately but highlight MKUC/DKUC as Marvel/Disney if desired
-            for prefix in royalty_rules:
-                col = cols[i % 3]
-                info = royalty_breakdown[prefix]
-                label = f"{prefix} Royalty ({int(info['rate']*100)}%)"
-                col.metric(label, f"{info['royalty']:,.2f}", delta=f"Net: {info['net_invoice']:,.2f}")
-                i += 1
-
-            # Total royalty across all prefixes
-            total_royalty = sum(info["royalty"] for info in royalty_breakdown.values())
+            # Show only consolidated total royalty metric (dashboard only)
             st.markdown("")  # small gap
-            st.metric("Total Royalty (all prefixes, dashboard only)", f"{total_royalty:,.2f}")
+            st.metric(
+                label="Total Royalty (dashboard only)",
+                value=f"{total_royalty:,.2f}",
+            )
 
             # --- Net Settlement after Cost & Total Royalty (dashboard only) ---
             net_settlement_after = total_payment - total_cost - total_royalty
             st.markdown("")  # small gap
-            st.metric("Net Settlement after Cost & Royalty (dashboard only)", f"{net_settlement_after:,.2f}")
+            st.metric(
+                label="Net Settlement after Cost & Royalty (dashboard only)",
+                value=f"{net_settlement_after:,.2f}",
+            )
 
             st.markdown("---")
 
