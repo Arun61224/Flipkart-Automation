@@ -335,7 +335,7 @@ def main():
             total_qty_diff = mapping["Qty_Diff (Settlement - Sale)"].sum()
             total_cost = mapping["Total Cost (Qty * Cost)"].sum()
 
-            # Removed Net Qty Diff metric as requested — showing 3 top metrics
+            # Top metrics (Net Qty Diff removed)
             c1, c2, c3 = st.columns(3)
             c1.metric("Rows (Order+SKU)", total_rows)
             c2.metric("Unique Orders", unique_orders)
@@ -346,17 +346,26 @@ def main():
             c6.metric("Total Settlement Payment", f"{total_payment:,.2f}")
             c7.metric("Total Cost (adjusted, filtered)", f"{total_cost:,.2f}")
 
-            # --- NEW: MKUC/DKUC shipment 10% calculation (dashboard only) ---
+            # --- Marvel/Disney Royalty (MKUC/DKUC 10%) calculation (dashboard only) ---
             sku_mask = mapping["SKU"].astype(str).str.upper().str.startswith(("MKUC", "DKUC"))
             mkuc_net = mapping.loc[sku_mask, "Invoice Amount"].sum()
             mkuc_net_positive = mkuc_net if mkuc_net > 0 else 0.0
-            mkuc_shipment_10pct = mkuc_net_positive * 0.10
+            marvel_disney_royalty = mkuc_net_positive * 0.10
 
+            # Show Marvel/Disney Royalty metric
             st.markdown("")  # small gap
             st.metric(
-                label="MKUC/DKUC Shipment 10% (dashboard only)",
-                value=f"{mkuc_shipment_10pct:,.2f}",
+                label="Marvel/Disney Royalty (MKUC/DKUC 10%)",
+                value=f"{marvel_disney_royalty:,.2f}",
                 delta=f"Net: {mkuc_net:,.2f}",
+            )
+
+            # --- NEW: Net Settlement after Cost & Royalty (dashboard only) ---
+            net_settlement_after = total_payment - total_cost - marvel_disney_royalty
+            st.markdown("")  # small gap
+            st.metric(
+                label="Net Settlement after Cost & Royalty (dashboard only)",
+                value=f"{net_settlement_after:,.2f}",
             )
 
             st.markdown("---")
@@ -381,7 +390,7 @@ def main():
             st.subheader("Final Mapped Report")
             st.dataframe(mapping_view, use_container_width=True)
 
-            # Download final mapped report (MKUC/DKUC 10% NOT included in excel)
+            # Download final mapped report (royalty/net-settlement NOT included in excel)
             st.markdown("---")
             st.subheader("Download")
             excel_bytes = final_report_to_excel_bytes(mapping_view)
