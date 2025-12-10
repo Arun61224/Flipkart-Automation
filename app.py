@@ -35,7 +35,6 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
             f'"{col_order_id}" and "{col_bank_value}" (check merged headers).'
         )
 
-    # Seller SKU (BG) and Qty (BH) by column index (header may be merged)
     sku_idx = excel_col_to_idx("BG")
     qty_idx = excel_col_to_idx("BH")
 
@@ -45,7 +44,6 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     col_seller_sku = orders.columns[sku_idx]
     col_qty = orders.columns[qty_idx]
 
-    # Keep only real order rows (Order ID starting with OD typically)
     df = orders.copy()
     df = df[df[col_order_id].astype(str).str.strip().str.startswith("OD", na=False)]
 
@@ -111,7 +109,6 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     bio = BytesIO(file_bytes)
     xls = pd.ExcelFile(bio)
 
-    # detect Sale Report sheet (flexible)
     target_sheet = None
     for s in xls.sheet_names:
         chk = s.lower().replace(" ", "")
@@ -124,7 +121,6 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     bio.seek(0)
     sales = pd.read_excel(bio, sheet_name=target_sheet, engine="openpyxl")
 
-    # Column positions: B=Order ID, F=SKU, N=Qty, H=Event
     order_idx = excel_col_to_idx("B")
     sku_idx = excel_col_to_idx("F")
     qty_idx = excel_col_to_idx("N")
@@ -138,13 +134,11 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     col_qty = sales.columns[qty_idx]
     col_event = sales.columns[event_idx]
 
-    # Order Date column (detect by name)
     order_date_candidates = [c for c in sales.columns if "order date" in str(c).lower()]
     if not order_date_candidates:
         raise ValueError("Could not find 'Order Date' column in Sale Report.")
     col_order_date = order_date_candidates[0]
 
-    # Final Invoice Amount (exact long name present in file)
     invoice_candidates = [c for c in sales.columns if "final invoice amount" in str(c).lower()]
     if not invoice_candidates:
         raise ValueError(
@@ -152,14 +146,12 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
         )
     col_invoice = invoice_candidates[0]
 
-    # Price Before Discount (optional)
     col_price_before = None
     for c in sales.columns:
         if "price before discount" in str(c).lower():
             col_price_before = c
             break
 
-    # Take columns (include price-before if present)
     cols = [col_order_date, col_order, col_sku, col_qty, col_event, col_invoice]
     if col_price_before is not None:
         cols.append(col_price_before)
@@ -172,7 +164,6 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     df["Item Quantity"] = pd.to_numeric(df[col_qty], errors="coerce")
     df["Event"] = df[col_event].astype(str).fillna("").str.strip()
 
-    # Map the original long invoice column into a short name for internal use/display
     df["Invoice Amount"] = pd.to_numeric(df[col_invoice], errors="coerce")
 
     if col_price_before is not None:
@@ -180,14 +171,12 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     else:
         df["Price Before Discount"] = 0.0
 
-    # ---------- NEW: convert Return rows to NEGATIVE values instead of removing ----------
+    # convert Return rows to NEGATIVE values instead of removing
     df["IsReturn"] = df["Event"].str.lower().eq("return")
-
     df.loc[df["IsReturn"], "Item Quantity"] = df.loc[df["IsReturn"], "Item Quantity"] * -1
     df.loc[df["IsReturn"], "Invoice Amount"] = df.loc[df["IsReturn"], "Invoice Amount"] * -1
     df.loc[df["IsReturn"], "Price Before Discount"] = df.loc[df["IsReturn"], "Price Before Discount"] * -1
 
-    # Keep rows that have necessary values
     df = df[
         df["Order ID"].notna()
         & df["SKU"].notna()
@@ -195,7 +184,6 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
         & df["Invoice Amount"].notna()
     ]
 
-    # Return selected columns (sale + return both present; returns are negative now)
     return df[
         [
             "Order Date",
@@ -244,13 +232,12 @@ def process_multiple_sales_cached(files_bytes_list):
     return combined, pivot, summary
 
 
-# ========================= COST FILE (SKU, Cost Price) =========================
+# ========================= COST FILE =========================
 @st.cache_data(show_spinner=False)
 def process_cost_file_cached(file_bytes: bytes) -> pd.DataFrame:
     bio = BytesIO(file_bytes)
     df = pd.read_excel(bio, sheet_name=0, engine="openpyxl")
 
-    # Detect SKU and Cost columns (flexible on header naming)
     sku_col = None
     cost_col = None
     for c in df.columns:
@@ -261,7 +248,7 @@ def process_cost_file_cached(file_bytes: bytes) -> pd.DataFrame:
             cost_col = c
 
     if sku_col is None or cost_col is None:
-        raise ValueError("Cost file must contain SKU and Cost/Cost Price columns (headers detected incorrectly).")
+        raise ValueError("Cost file must contain SKU and Cost/Cost Price columns.")
 
     out = df[[sku_col, cost_col]].copy()
     out["SKU"] = out[sku_col].astype(str).str.strip()
@@ -270,7 +257,7 @@ def process_cost_file_cached(file_bytes: bytes) -> pd.DataFrame:
     return out[["SKU", "Cost Price"]]
 
 
-# ========================= EXPORT TO EXCEL (single sheet) =========================
+# ========================= EXPORT TO EXCEL =========================
 def final_report_to_excel_bytes(df_mapping: pd.DataFrame):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
@@ -283,7 +270,7 @@ def main():
     st.set_page_config(page_title="Flipkart Reconciliation Tool", page_icon="📊", layout="wide")
     st.title("📊 Flipkart Reconciliation Tool")
 
-    # ---------- Sidebar uploads ----------
+    # Sidebar uploads
     st.sidebar.header("Upload Files")
     settlement_files = st.sidebar.file_uploader(
         "Settlement Excel file(s) (Orders sheet inside)", type=["xlsx", "xls"], accept_multiple_files=True
@@ -299,7 +286,6 @@ def main():
 
     if settlement_files and sales_files:
         try:
-            # Read & process (cached)
             set_raw, set_pivot, set_summary = process_multiple_orders_cached([f.getvalue() for f in settlement_files])
             sale_raw, sale_pivot, sale_summary = process_multiple_sales_cached([f.getvalue() for f in sales_files])
 
@@ -311,52 +297,35 @@ def main():
                 how="left",
             )
 
-            # clean and fillna
             mapping = mapping.drop(columns=["Seller SKU"], errors="ignore")
             mapping["Settlement_Qty"] = mapping["Settlement_Qty"].fillna(0)
             mapping["Payment_Received"] = mapping["Payment_Received"].fillna(0.0)
 
-            # Qty diff (calculation - can be negative/positive)
             mapping["Qty_Diff (Settlement - Sale)"] = mapping["Settlement_Qty"] - mapping["Item Quantity"]
 
-            # Amount diff CALCULATION (backend only – not shown)
+            # Backend amount diff (hidden in report)
             mapping["Amount_Diff (Settlement - Invoice)"] = mapping["Payment_Received"] - mapping["Invoice Amount"]
 
-            # Payment received against this Amount = aggregated Price Before Discount
             mapping["Payment received agaist this Amount"] = mapping["Price Before Discount"]
 
-            # Merge cost file if provided
+            # Merge cost file
             if cost_file is not None:
                 cost_df = process_cost_file_cached(cost_file.getvalue())
                 mapping = mapping.merge(cost_df, on="SKU", how="left")
-                # if cost missing, set 0 to avoid NaN
                 mapping["Cost Price"] = mapping["Cost Price"].fillna(0.0)
             else:
                 mapping["Cost Price"] = 0.0
 
-            # ---------------- NEW: Adjust Cost Price based on rules ----------------
-            # Rules:
-            # - If return entry (Item Quantity < 0) -> use 50% of Cost Price
-            # - If Item Quantity == 0 -> use 20% of Cost Price
-            # - Else normal sale -> 100% Cost Price
-            mapping["Cost Price Adjusted"] = mapping["Cost Price"]  # default
-
-            # Apply return rule (50%)
+            # Adjusted cost rules
+            mapping["Cost Price Adjusted"] = mapping["Cost Price"]
             mask_return = mapping["Item Quantity"] < 0
             mapping.loc[mask_return, "Cost Price Adjusted"] = mapping.loc[mask_return, "Cost Price"] * 0.5
-
-            # Apply zero-qty rule (20%)
             mask_zero = mapping["Item Quantity"] == 0
             mapping.loc[mask_zero, "Cost Price Adjusted"] = mapping.loc[mask_zero, "Cost Price"] * 0.2
-
-            # Total Cost uses adjusted price
             mapping["Total Cost (Qty * Adjusted Cost)"] = mapping["Item Quantity"] * mapping["Cost Price Adjusted"]
-
-            # Keep original Total Cost column name compatibility (optional)
-            # Replace previous "Total Cost (Qty * Cost)" with adjusted version
             mapping["Total Cost (Qty * Cost)"] = mapping["Total Cost (Qty * Adjusted Cost)"]
 
-            # ---------- Summary / top metrics ----------
+            # ---------- Summary / dashboard metrics ----------
             st.subheader("Summary")
             total_rows = mapping.shape[0]
             unique_orders = mapping["Order ID"].nunique()
@@ -365,6 +334,13 @@ def main():
             total_payment = mapping["Payment_Received"].sum()
             total_qty_diff = mapping["Qty_Diff (Settlement - Sale)"].sum()
             total_cost = mapping["Total Cost (Qty * Cost)"].sum()
+
+            # --- NEW: MKUC/DKUC shipment 10% calculation (dashboard only) ---
+            # Net invoice for SKUs starting with MKUC or DKUC (case-insensitive)
+            sku_mask = mapping["SKU"].astype(str).str.upper().str.startswith(("MKUC", "DKUC"))
+            mkuc_net = mapping.loc[sku_mask, "Invoice Amount"].sum()
+            mkuc_net_positive = mkuc_net if mkuc_net > 0 else 0.0
+            mkuc_shipment_10pct = mkuc_net_positive * 0.10
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Rows (Order+SKU)", total_rows)
@@ -377,9 +353,17 @@ def main():
             c6.metric("Total Settlement Payment", f"{total_payment:,.2f}")
             c7.metric("Total Cost (adjusted, filtered)", f"{total_cost:,.2f}")
 
+            # Display MKUC/DKUC shipment 10% separately (dashboard-only)
+            st.markdown("")  # small gap
+            st.metric(
+                label="MKUC/DKUC Shipment 10% (dashboard only)",
+                value=f"{mkuc_shipment_10pct:,.2f}",
+                delta=f"Net: {mkuc_net:,.2f}",
+            )
+
             st.markdown("---")
 
-            # ---------- Build final view (don't show backend-only columns) ----------
+            # Final view (exclude backend-only columns)
             final_cols = [
                 "Order Date",
                 "Order ID",
@@ -390,17 +374,16 @@ def main():
                 "Settlement_Qty",
                 "Qty_Diff (Settlement - Sale)",
                 "Payment_Received",
-                "Cost Price",                # original cost price
-                "Cost Price Adjusted",       # show adjusted for clarity
-                "Total Cost (Qty * Cost)",   # adjusted total cost (kept name for compatibility)
+                "Cost Price",
+                "Cost Price Adjusted",
+                "Total Cost (Qty * Cost)",
             ]
-            # ensure only existing cols used
             mapping_view = mapping[[c for c in final_cols if c in mapping.columns]].copy()
 
             st.subheader("Final Mapped Report")
             st.dataframe(mapping_view, use_container_width=True)
 
-            # ---------- Download only final mapped report sheet ----------
+            # Download final mapped report (MKUC/DKUC 10% NOT included in excel)
             st.markdown("---")
             st.subheader("Download")
             excel_bytes = final_report_to_excel_bytes(mapping_view)
