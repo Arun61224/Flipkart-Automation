@@ -335,25 +335,23 @@ def main():
             total_qty_diff = mapping["Qty_Diff (Settlement - Sale)"].sum()
             total_cost = mapping["Total Cost (Qty * Cost)"].sum()
 
-            # --- NEW: MKUC/DKUC shipment 10% calculation (dashboard only) ---
-            # Net invoice for SKUs starting with MKUC or DKUC (case-insensitive)
-            sku_mask = mapping["SKU"].astype(str).str.upper().str.startswith(("MKUC", "DKUC"))
-            mkuc_net = mapping.loc[sku_mask, "Invoice Amount"].sum()
-            mkuc_net_positive = mkuc_net if mkuc_net > 0 else 0.0
-            mkuc_shipment_10pct = mkuc_net_positive * 0.10
-
-            c1, c2, c3, c4 = st.columns(4)
+            # Removed Net Qty Diff metric as requested — showing 3 top metrics
+            c1, c2, c3 = st.columns(3)
             c1.metric("Rows (Order+SKU)", total_rows)
             c2.metric("Unique Orders", unique_orders)
             c3.metric("Unique SKUs", unique_skus)
-            c4.metric("Net Qty Diff", int(total_qty_diff))
 
             c5, c6, c7 = st.columns(3)
             c5.metric("Total Invoice Amount", f"{total_invoice:,.2f}")
             c6.metric("Total Settlement Payment", f"{total_payment:,.2f}")
             c7.metric("Total Cost (adjusted, filtered)", f"{total_cost:,.2f}")
 
-            # Display MKUC/DKUC shipment 10% separately (dashboard-only)
+            # --- NEW: MKUC/DKUC shipment 10% calculation (dashboard only) ---
+            sku_mask = mapping["SKU"].astype(str).str.upper().str.startswith(("MKUC", "DKUC"))
+            mkuc_net = mapping.loc[sku_mask, "Invoice Amount"].sum()
+            mkuc_net_positive = mkuc_net if mkuc_net > 0 else 0.0
+            mkuc_shipment_10pct = mkuc_net_positive * 0.10
+
             st.markdown("")  # small gap
             st.metric(
                 label="MKUC/DKUC Shipment 10% (dashboard only)",
