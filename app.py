@@ -453,14 +453,26 @@ def main():
 
             mapping = mapping.drop(columns=["Seller SKU"], errors="ignore")
 
-            mapping["Settlement_Qty"] = mapping.get("Settlement_Qty", pd.Series(0, index=mapping.index)).fillna(0)
-            mapping["Payment_Received"] = mapping.get("Payment_Received", pd.Series(0.0, index=mapping.index)).fillna(0.0)
+            # FIX: Use safe assignment instead of .get() with defaults that might cause size mismatch
+            if "Settlement_Qty" in mapping.columns:
+                mapping["Settlement_Qty"] = mapping["Settlement_Qty"].fillna(0)
+            else:
+                mapping["Settlement_Qty"] = 0
+
+            if "Payment_Received" in mapping.columns:
+                mapping["Payment_Received"] = mapping["Payment_Received"].fillna(0.0)
+            else:
+                mapping["Payment_Received"] = 0.0
 
             mapping["Qty_Diff (Settlement - Sale)"] = mapping["Settlement_Qty"] - mapping["Item Quantity"]
 
             mapping["Amount_Diff (Settlement - Invoice)"] = mapping["Payment_Received"] - mapping["Invoice Amount"]
 
-            mapping["Payment received agaist this Amount"] = mapping.get("Price Before Discount", 0.0)
+            # FIX: Handle missing 'Price Before Discount' safely to avoid length error
+            if "Price Before Discount" in mapping.columns:
+                mapping["Payment received agaist this Amount"] = mapping["Price Before Discount"]
+            else:
+                mapping["Payment received agaist this Amount"] = 0.0
 
             if cost_file is not None:
                 cost_df = process_cost_file_cached(cost_file.getvalue())
@@ -511,8 +523,16 @@ def main():
                 "MAC": 0.10,
             }
             total_royalty = 0.0
+            
+            # FIX: Ensure we have a valid Series for SKU matching, even if column is missing
+            if "SKU" in mapping.columns:
+                sku_series = mapping["SKU"].astype(str).fillna("")
+            else:
+                sku_series = pd.Series("", index=mapping.index)
+
             for prefix, rate in royalty_rules.items():
-                mask = mapping.get("SKU", pd.Series([], index=mapping.index)).astype(str).str.upper().str.startswith(prefix)
+                # Use the safe sku_series instead of mapping.get with unsafe default
+                mask = sku_series.str.upper().str.startswith(prefix)
                 net_invoice = mapping.loc[mask, "Invoice Amount"].sum() if "Invoice Amount" in mapping.columns else 0.0
                 net_positive = net_invoice if net_invoice > 0 else 0.0
                 total_royalty += net_positive * rate
