@@ -5,7 +5,7 @@ import pandas as pd
 from io import BytesIO
 
 # -----------------------
-# Helpers
+# Helper functions
 # -----------------------
 def excel_col_to_idx(col_name: str) -> int:
     col_name = col_name.strip().upper()
@@ -15,56 +15,70 @@ def excel_col_to_idx(col_name: str) -> int:
             idx = idx * 26 + (ord(c) - ord("A") + 1)
     return idx - 1
 
+
 def find_col_by_keywords(cols, keywords):
-    """Return first column name that contains all keywords (case-insensitive)"""
-    low = [c.lower() for c in cols]
+    """Return first column name that contains all keywords (case-insensitive)."""
+    low = [str(c).lower() for c in cols]
     for i, c in enumerate(low):
         if all(k.lower() in c for k in keywords):
             return cols[i]
     return None
 
-def find_18digit_column(df):
-    """Try to detect a column where many values are exactly 18 digits."""
+
+def find_18digit_column(df: pd.DataFrame):
+    """Detect a column where many values look like 18+ digit numeric IDs."""
     candidate = None
     best_score = 0
-    pattern = re.compile(r"^\d{18}$")
+    pattern = re.compile(r"^\d{18,}$")  # 18 or more digits
     for c in df.columns:
         s = df[c].dropna().astype(str).str.strip()
         if s.empty:
             continue
         match_frac = (s.str.match(pattern)).mean()
-        if match_frac > best_score and match_frac >= 0.2:
+        if match_frac > best_score and match_frac >= 0.2:  # >=20% rows look like ID
             best_score = match_frac
             candidate = c
     return candidate
 
-def ensure_order_item_id_column_settlement(df):
-    """Detect Order Item ID in settlement and add normalized 'Order Item ID' with leading apostrophe."""
-    # 1) try header-based detection
-    cand = find_col_by_keywords(df.columns, ["order", "item", "id"])
-    if cand is None:
-        cand = find_col_by_keywords(df.columns, ["orderitem", "id"])
-    # 2) try detect 18-digit column
-    if cand is None:
-        cand = find_18digit_column(df)
-    # 3) if found, create normalized 'Order Item ID' (string with leading apostrophe)
-    if cand is not None:
-        # Convert to string and prefix apostrophe — also strip spaces
-        df["Order Item ID"] = "'" + df[cand].astype(str).str.strip()
-        return cand
-    return None
 
-def ensure_order_item_id_column_sales(df):
-    """Same for sales file."""
+def normalize_order_item_id(series: pd.Series) -> pd.Series:
+    """
+    Convert Order Item ID series to TEXT-like string, remove trailing .0, and prefix with '.
+    This mimics Excel text + apostrophe behaviour.
+    """
+    s = series.astype(str).str.strip()
+    # remove trailing .0 from float-like strings
+    s = s.str.replace(r"\.0$", "", regex=True)
+    # also remove any scientific notation 'E+xx' if accidentally present
+    s = s.str.replace(r"\.0+e\+\d+$", "", regex=True, flags=re.IGNORECASE)
+    return "'" + s
+
+
+def ensure_order_item_id_column_settlement(df: pd.DataFrame):
+    """Detect Order Item ID column in settlement df and create normalized 'Order Item ID'."""
     cand = find_col_by_keywords(df.columns, ["order", "item", "id"])
     if cand is None:
         cand = find_col_by_keywords(df.columns, ["orderitem", "id"])
     if cand is None:
         cand = find_18digit_column(df)
+
     if cand is not None:
-        df["Order Item ID"] = "'" + df[cand].astype(str).str.strip()
-        return cand
-    return None
+        df["Order Item ID"] = normalize_order_item_id(df[cand])
+    return cand
+
+
+def ensure_order_item_id_column_sales(df: pd.DataFrame):
+    """Detect Order Item ID column in sales df and create normalized 'Order Item ID'."""
+    cand = find_col_by_keywords(df.columns, ["order", "item", "id"])
+    if cand is None:
+        cand = find_col_by_keywords(df.columns, ["orderitem", "id"])
+    if cand is None:
+        cand = find_18digit_column(df)
+
+    if cand is not None:
+        df["Order Item ID"] = normalize_order_item_id(df[cand])
+    return cand
+
 
 # ======================================================
 #   PART 1 – SETTLEMENT FILES (Orders sheet)
@@ -77,13 +91,20 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
         raise ValueError('Sheet named "Orders" not found in the uploaded settlement file.')
 
     bio.seek(0)
+    # read as usual; we will convert needed cols manually
     orders = pd.read_excel(bio, sheet_name="Orders", engine="openpyxl")
 
-    # Try to find Order ID column (fallback) and Bank Settlement Value column
-    col_order_id = find_col_by_keywords(orders.columns, ["transaction", "summary"]) or find_col_by_keywords(orders.columns, ["order", "id"]) or orders.columns[0]
+    # main ID / amount columns
+    col_order_id = (
+        find_col_by_keywords(orders.columns, ["transaction", "summary"])
+        or find_col_by_keywords(orders.columns, ["order", "id"])
+        or orders.columns[0]
+    )
+
     col_bank_value = None
     for c in orders.columns:
-        if "bank" in str(c).lower() and "settlement" in str(c).lower():
+        txt = str(c).lower()
+        if "bank" in txt and "settlement" in txt:
             col_bank_value = c
             break
     if col_bank_value is None:
@@ -97,55 +118,50 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
         else:
             raise ValueError("Cannot detect Bank Settlement Value column in Orders sheet.")
 
-    # Detect Seller SKU (BG) and Qty (BH) by index if possible
+    # Seller SKU (BG) & Qty (BH) by index, with fallback
     sku_idx = excel_col_to_idx("BG")
     qty_idx = excel_col_to_idx("BH")
-    if len(orders.columns) <= max(sku_idx, qty_idx):
-        col_seller_sku = find_col_by_keywords(orders.columns, ["seller", "sku"]) or find_col_by_keywords(orders.columns, ["sku"])
-        col_qty = find_col_by_keywords(orders.columns, ["qty", "quantity"]) or find_col_by_keywords(orders.columns, ["quantity"])
-        if col_seller_sku is None or col_qty is None:
-            raise ValueError("Orders sheet missing Seller SKU (BG) / Qty (BH) columns and fallback detection failed.")
-    else:
+    if len(orders.columns) > max(sku_idx, qty_idx):
         col_seller_sku = orders.columns[sku_idx]
         col_qty = orders.columns[qty_idx]
+    else:
+        col_seller_sku = find_col_by_keywords(orders.columns, ["seller", "sku"]) or find_col_by_keywords(
+            orders.columns, ["sku"]
+        )
+        col_qty = find_col_by_keywords(orders.columns, ["qty", "quantity"]) or find_col_by_keywords(
+            orders.columns, ["quantity"]
+        )
+        if col_seller_sku is None or col_qty is None:
+            raise ValueError(
+                "Orders sheet missing Seller SKU (BG) / Qty (BH) columns and fallback detection failed."
+            )
 
+    # work on copy
     df = orders.copy()
-    if col_order_id in df.columns:
-        df = df[df[col_order_id].astype(str).str.strip().str.startswith("OD", na=False) | df[col_order_id].notna()]
 
-    # Numeric conversions
-    df[col_bank_value] = pd.to_numeric(df[col_bank_value], errors="coerce")
-    df[col_qty] = pd.to_numeric(df[col_qty], errors="coerce")
+    # ---------- NEW: detect / normalize Order Item ID as TEXT with ' prefix ----------
+    ensure_order_item_id_column_settlement(df)
 
-    # Keep rows where essentials present
-    df = df[
-        df[col_bank_value].notna()
-        & df[col_seller_sku].notna()
-        & df[col_qty].notna()
-    ]
+    # filter rows (keep ones where ID not totally blank)
+    df = df[df[col_bank_value].notna() & df[col_seller_sku].notna() & df[col_qty].notna()]
 
-    # ---------- NEW: detect & convert Order Item ID to text with leading apostrophe ----------
-    found_order_item_col = ensure_order_item_id_column_settlement(df)
-    # Also ensure Order ID column exists as string
+    # numeric conversions
     df["Order ID"] = df[col_order_id].astype(str).str.strip()
+    df["Seller SKU"] = df[col_seller_sku]
+    df["Settlement Qty"] = pd.to_numeric(df[col_qty], errors="coerce")
+    df["Payment Received"] = pd.to_numeric(df[col_bank_value], errors="coerce")
 
-    # Build cleaned df columns — include Order Item ID if found
-    cols_to_take = ["Order ID", col_seller_sku, col_qty, col_bank_value]
+    df = df[df["Settlement Qty"].notna() & df["Payment Received"].notna()]
+
+    keep_cols = ["Order ID", "Seller SKU", "Settlement Qty", "Payment Received"]
     if "Order Item ID" in df.columns:
-        cols_to_take.insert(1, "Order Item ID")  # keep Order Item ID right after Order ID
-
-    df_clean = df[cols_to_take].rename(
-        columns={
-            col_seller_sku: "Seller SKU",
-            col_qty: "Settlement Qty",
-            col_bank_value: "Payment Received",
-        }
-    )
+        keep_cols.insert(1, "Order Item ID")
+    df_clean = df[keep_cols].copy()
 
     return df_clean
 
+
 def summarize_orders(df_clean: pd.DataFrame):
-    # Group by Order Item ID+SKU if exist, else by Order ID+SKU
     if "Order Item ID" in df_clean.columns:
         group_cols = ["Order Item ID", "Seller SKU"]
     else:
@@ -168,12 +184,14 @@ def summarize_orders(df_clean: pd.DataFrame):
     }
     return pivot, summary
 
+
 @st.cache_data(show_spinner=False)
 def process_multiple_orders_cached(files_bytes_list):
     all_raw = [process_orders_excel_from_bytes(fb) for fb in files_bytes_list]
     combined = pd.concat(all_raw, ignore_index=True)
     pivot, summary = summarize_orders(combined)
     return combined, pivot, summary
+
 
 # ======================================================
 #   PART 2 – SALES REPORT FILES
@@ -185,6 +203,7 @@ def clean_sku_text(v):
     if s.upper().startswith("SKU:"):
         s = s[4:]
     return s.strip()
+
 
 def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     bio = BytesIO(file_bytes)
@@ -209,36 +228,44 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
 
     try:
         col_order = sales.columns[order_idx]
-    except:
+    except Exception:
         col_order = find_col_by_keywords(sales.columns, ["order", "id"]) or sales.columns[0]
 
     try:
         col_sku = sales.columns[sku_idx]
-    except:
+    except Exception:
         col_sku = find_col_by_keywords(sales.columns, ["sku"]) or sales.columns[1]
 
     try:
         col_qty = sales.columns[qty_idx]
-    except:
+    except Exception:
         col_qty = find_col_by_keywords(sales.columns, ["qty", "quantity"]) or sales.columns[2]
 
-    col_event_sub = find_col_by_keywords(sales.columns, ["event", "sub", "type"]) or find_col_by_keywords(sales.columns, ["event", "subtype"])
+    # Event Sub Type (priority)
+    col_event_sub = find_col_by_keywords(sales.columns, ["event", "sub", "type"]) or find_col_by_keywords(
+        sales.columns, ["event", "subtype"]
+    )
     if col_event_sub is None:
         try:
             col_event_sub = sales.columns[event_idx]
-        except:
+        except Exception:
             col_event_sub = find_col_by_keywords(sales.columns, ["event"]) or sales.columns[4]
 
+    # Order Date
     order_date_candidates = [c for c in sales.columns if "order date" in str(c).lower()]
     if not order_date_candidates:
         raise ValueError("Could not find 'Order Date' column in Sale Report.")
     col_order_date = order_date_candidates[0]
 
+    # Invoice
     invoice_candidates = [c for c in sales.columns if "final invoice amount" in str(c).lower()]
     if not invoice_candidates:
-        raise ValueError("Could not find 'Final Invoice Amount (Price after discount+Shipping Charges)' column in Sale Report.")
+        raise ValueError(
+            "Could not find 'Final Invoice Amount (Price after discount+Shipping Charges)' column in Sale Report."
+        )
     col_invoice = invoice_candidates[0]
 
+    # Price before discount
     col_price_before = None
     for c in sales.columns:
         if "price before discount" in str(c).lower():
@@ -256,24 +283,23 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     df["SKU"] = df[col_sku].apply(clean_sku_text)
     df["Item Quantity"] = pd.to_numeric(df[col_qty], errors="coerce")
     df["Event Sub Type"] = df[col_event_sub].astype(str).fillna("").str.strip()
-
     df["Invoice Amount"] = pd.to_numeric(df[col_invoice], errors="coerce")
     if col_price_before is not None:
         df["Price Before Discount"] = pd.to_numeric(df[col_price_before], errors="coerce")
     else:
         df["Price Before Discount"] = 0.0
 
-    # Keep only Event Sub Type = Sale or Return
+    # ---------- keep only Sale + Return ----------
     df = df[df["Event Sub Type"].str.lower().isin(["sale", "return"])]
 
-    # Detect & normalize Order Item ID if present; convert to text with leading apostrophe
-    found_order_item_col = ensure_order_item_id_column_sales(df)
+    # ---------- detect / normalize Order Item ID (text + ') ----------
+    ensure_order_item_id_column_sales(df)
 
-    # Convert returns to negative values (but keep rows)
+    # ---------- Return rows negative ----------
     df["IsReturn"] = df["Event Sub Type"].str.lower().eq("return")
-    df.loc[df["IsReturn"], "Item Quantity"] = df.loc[df["IsReturn"], "Item Quantity"] * -1
-    df.loc[df["IsReturn"], "Invoice Amount"] = df.loc[df["IsReturn"], "Invoice Amount"] * -1
-    df.loc[df["IsReturn"], "Price Before Discount"] = df.loc[df["IsReturn"], "Price Before Discount"] * -1
+    df.loc[df["IsReturn"], "Item Quantity"] *= -1
+    df.loc[df["IsReturn"], "Invoice Amount"] *= -1
+    df.loc[df["IsReturn"], "Price Before Discount"] *= -1
 
     df = df[
         df["Order ID"].notna()
@@ -282,11 +308,11 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
         & df["Invoice Amount"].notna()
     ]
 
-    # Return with Order Item ID included if present
     cols_return = ["Order Date", "Order ID", "SKU", "Item Quantity", "Invoice Amount", "Price Before Discount"]
     if "Order Item ID" in df.columns:
         cols_return.insert(1, "Order Item ID")
     return df[cols_return]
+
 
 def summarize_sales(df: pd.DataFrame):
     if "Order Item ID" in df.columns:
@@ -320,6 +346,7 @@ def summarize_sales(df: pd.DataFrame):
     }
     return pivot, summary
 
+
 @st.cache_data(show_spinner=False)
 def process_multiple_sales_cached(files_bytes_list):
     all_raw = [load_single_sales_df_from_bytes(fb) for fb in files_bytes_list]
@@ -327,7 +354,8 @@ def process_multiple_sales_cached(files_bytes_list):
     pivot, summary = summarize_sales(combined)
     return combined, pivot, summary
 
-# ========================= COST FILE (SKU, Cost Price) =========================
+
+# ========================= COST FILE =========================
 @st.cache_data(show_spinner=False)
 def process_cost_file_cached(file_bytes: bytes) -> pd.DataFrame:
     bio = BytesIO(file_bytes)
@@ -343,7 +371,7 @@ def process_cost_file_cached(file_bytes: bytes) -> pd.DataFrame:
             cost_col = c
 
     if sku_col is None or cost_col is None:
-        raise ValueError("Cost file must contain SKU and Cost/Cost Price columns (headers detected incorrectly).")
+        raise ValueError("Cost file must contain SKU and Cost/Cost Price columns.")
 
     out = df[[sku_col, cost_col]].copy()
     out["SKU"] = out[sku_col].astype(str).str.strip()
@@ -351,12 +379,14 @@ def process_cost_file_cached(file_bytes: bytes) -> pd.DataFrame:
     out = out[out["SKU"].notna() & out["Cost Price"].notna()]
     return out[["SKU", "Cost Price"]]
 
+
 # ========================= EXPORT TO EXCEL =========================
 def final_report_to_excel_bytes(df_mapping: pd.DataFrame):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df_mapping.to_excel(writer, index=False, sheet_name="Final_Mapped_Report")
     return output.getvalue()
+
 
 # ========================= STREAMLIT APP =========================
 def main():
@@ -379,23 +409,22 @@ def main():
 
     if settlement_files and sales_files:
         try:
-            # Process files
             set_raw, set_pivot, set_summary = process_multiple_orders_cached([f.getvalue() for f in settlement_files])
             sale_raw, sale_pivot, sale_summary = process_multiple_sales_cached([f.getvalue() for f in sales_files])
 
-            # Decide mapping keys (prefer Order Item ID if both sides have it)
-            left_has_oi = "Order Item ID" in set_pivot.columns or "Order Item ID" in set_raw.columns
-            right_has_oi = "Order Item ID" in sale_pivot.columns or "Order Item ID" in sale_raw.columns
+            left_has_oi = "Order Item ID" in set_pivot.columns
+            right_has_oi = "Order Item ID" in sale_pivot.columns
 
             if left_has_oi and right_has_oi:
-                # left key names: set_pivot might have column name 'Order Item ID' or be index - ensure present
+                # Map on Order Item ID + SKU
                 mapping = sale_pivot.merge(
-                    set_pivot[[ "Order Item ID", "Seller SKU", "Settlement_Qty", "Payment_Received"]] if "Order Item ID" in set_pivot.columns else set_pivot[[ set_pivot.columns[0], "Seller SKU", "Settlement_Qty", "Payment_Received"]],
+                    set_pivot[["Order Item ID", "Seller SKU", "Settlement_Qty", "Payment_Received"]],
                     left_on=["Order Item ID", "SKU"],
                     right_on=["Order Item ID", "Seller SKU"],
                     how="left",
                 )
             else:
+                # fallback to Order ID + SKU
                 mapping = sale_pivot.merge(
                     set_pivot[["Order ID", "Seller SKU", "Settlement_Qty", "Payment_Received"]],
                     left_on=["Order ID", "SKU"],
@@ -407,15 +436,13 @@ def main():
             mapping["Settlement_Qty"] = mapping["Settlement_Qty"].fillna(0)
             mapping["Payment_Received"] = mapping["Payment_Received"].fillna(0.0)
 
-            # Qty diff
             mapping["Qty_Diff (Settlement - Sale)"] = mapping["Settlement_Qty"] - mapping["Item Quantity"]
 
-            # Backend amount diff (hidden)
             mapping["Amount_Diff (Settlement - Invoice)"] = mapping["Payment_Received"] - mapping["Invoice Amount"]
 
             mapping["Payment received agaist this Amount"] = mapping["Price Before Discount"]
 
-            # Merge cost file if provided
+            # Cost merge
             if cost_file is not None:
                 cost_df = process_cost_file_cached(cost_file.getvalue())
                 mapping = mapping.merge(cost_df, on="SKU", how="left")
@@ -426,13 +453,13 @@ def main():
             # Adjusted cost rules
             mapping["Cost Price Adjusted"] = mapping["Cost Price"]
             mask_return = mapping["Item Quantity"] < 0
-            mapping.loc[mask_return, "Cost Price Adjusted"] = mapping.loc[mask_return, "Cost Price"] * 0.5
+            mapping.loc[mask_return, "Cost Price Adjusted"] *= 0.5
             mask_zero = mapping["Item Quantity"] == 0
-            mapping.loc[mask_zero, "Cost Price Adjusted"] = mapping.loc[mask_zero, "Cost Price"] * 0.2
+            mapping.loc[mask_zero, "Cost Price Adjusted"] *= 0.2
             mapping["Total Cost (Qty * Adjusted Cost)"] = mapping["Item Quantity"] * mapping["Cost Price Adjusted"]
             mapping["Total Cost (Qty * Cost)"] = mapping["Total Cost (Qty * Adjusted Cost)"]
 
-            # ---------- Summary / dashboard metrics ----------
+            # ---------- Summary metrics ----------
             st.subheader("Summary")
             total_rows = mapping.shape[0]
             unique_orders = mapping["Order ID"].nunique() if "Order ID" in mapping.columns else mapping.shape[0]
@@ -441,7 +468,6 @@ def main():
             total_payment = mapping["Payment_Received"].sum()
             total_cost = mapping["Total Cost (Qty * Cost)"].sum()
 
-            # Top metrics
             c1, c2, c3 = st.columns(3)
             c1.metric("Rows (Order+SKU)", total_rows)
             c2.metric("Unique Orders", unique_orders)
@@ -452,7 +478,7 @@ def main():
             c6.metric("Total Settlement Payment", f"{total_payment:,.2f}")
             c7.metric("Total Cost (adjusted, filtered)", f"{total_cost:,.2f}")
 
-            # ---------- Consolidated royalty across prefixes ----------
+            # Royalty rules
             royalty_rules = {
                 "MKUC": 0.10,
                 "DKUC": 0.10,
@@ -468,17 +494,15 @@ def main():
                 net_positive = net_invoice if net_invoice > 0 else 0.0
                 total_royalty += net_positive * rate
 
-            st.markdown("")  # small gap
+            st.markdown("")
             st.metric("Total Royalty (dashboard only)", f"{total_royalty:,.2f}")
 
-            # Net settlement after cost & royalty (dashboard only)
             net_settlement_after = total_payment - total_cost - total_royalty
-            st.markdown("")  # small gap
+            st.markdown("")
             st.metric("Net Settlement after Cost & Royalty (dashboard only)", f"{net_settlement_after:,.2f}")
 
             st.markdown("---")
 
-            # Final columns to show (hide backend-only columns)
             final_cols = [
                 "Order Date",
                 "Order Item ID" if "Order Item ID" in mapping.columns else None,
@@ -500,7 +524,6 @@ def main():
             st.subheader("Final Mapped Report")
             st.dataframe(mapping_view, use_container_width=True)
 
-            # Download final mapped report
             st.markdown("---")
             st.subheader("Download")
             excel_bytes = final_report_to_excel_bytes(mapping_view)
@@ -515,6 +538,7 @@ def main():
             st.error(f"Error: {e}")
     else:
         st.info("Upload Settlement and Sale Report files from the sidebar to start reconciliation.")
+
 
 if __name__ == "__main__":
     main()
