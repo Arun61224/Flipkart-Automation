@@ -44,13 +44,9 @@ def find_18digit_column(df: pd.DataFrame):
 def normalize_order_item_id(series: pd.Series) -> pd.Series:
     """
     Convert Order Item ID series to TEXT-like string, remove trailing .0, and prefix with '.
-    This mimics Excel text + apostrophe behaviour.
     """
     s = series.astype(str).str.strip()
-    # remove trailing .0 from float-like strings
     s = s.str.replace(r"\.0$", "", regex=True)
-    # also remove any scientific notation 'E+xx' if accidentally present
-    s = s.str.replace(r"\.0+e\+\d+$", "", regex=True, flags=re.IGNORECASE)
     return "'" + s
 
 
@@ -91,10 +87,8 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
         raise ValueError('Sheet named "Orders" not found in the uploaded settlement file.')
 
     bio.seek(0)
-    # read as usual; we will convert needed cols manually
     orders = pd.read_excel(bio, sheet_name="Orders", engine="openpyxl")
 
-    # main ID / amount columns
     col_order_id = (
         find_col_by_keywords(orders.columns, ["transaction", "summary"])
         or find_col_by_keywords(orders.columns, ["order", "id"])
@@ -118,7 +112,6 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
         else:
             raise ValueError("Cannot detect Bank Settlement Value column in Orders sheet.")
 
-    # Seller SKU (BG) & Qty (BH) by index, with fallback
     sku_idx = excel_col_to_idx("BG")
     qty_idx = excel_col_to_idx("BH")
     if len(orders.columns) > max(sku_idx, qty_idx):
@@ -136,18 +129,14 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
                 "Orders sheet missing Seller SKU (BG) / Qty (BH) columns and fallback detection failed."
             )
 
-    # work on copy
     df = orders.copy()
 
-    # ---------- NEW: detect / normalize Order Item ID as TEXT with ' prefix ----------
     ensure_order_item_id_column_settlement(df)
 
-    # filter rows (keep ones where ID not totally blank)
     df = df[df[col_bank_value].notna() & df[col_seller_sku].notna() & df[col_qty].notna()]
 
-    # numeric conversions
     df["Order ID"] = df[col_order_id].astype(str).str.strip()
-    df["Seller SKU"] = df[col_seller_sku]
+    df["Seller SKU"] = df[col_seller_sku].astype(str).str.strip()
     df["Settlement Qty"] = pd.to_numeric(df[col_qty], errors="coerce")
     df["Payment Received"] = pd.to_numeric(df[col_bank_value], errors="coerce")
 
@@ -177,7 +166,7 @@ def summarize_orders(df_clean: pd.DataFrame):
     )
     summary = {
         "rows": df_clean.shape[0],
-        "orders": df_clean["Order ID"].nunique(),
+        "orders": df_clean["Order ID"].nunique() if "Order ID" in df_clean.columns else df_clean.shape[0],
         "skus": df_clean["Seller SKU"].nunique(),
         "qty": df_clean["Settlement Qty"].sum(),
         "payment": df_clean["Payment Received"].sum(),
@@ -241,7 +230,6 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     except Exception:
         col_qty = find_col_by_keywords(sales.columns, ["qty", "quantity"]) or sales.columns[2]
 
-    # Event Sub Type (priority)
     col_event_sub = find_col_by_keywords(sales.columns, ["event", "sub", "type"]) or find_col_by_keywords(
         sales.columns, ["event", "subtype"]
     )
@@ -251,13 +239,11 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
         except Exception:
             col_event_sub = find_col_by_keywords(sales.columns, ["event"]) or sales.columns[4]
 
-    # Order Date
     order_date_candidates = [c for c in sales.columns if "order date" in str(c).lower()]
     if not order_date_candidates:
         raise ValueError("Could not find 'Order Date' column in Sale Report.")
     col_order_date = order_date_candidates[0]
 
-    # Invoice
     invoice_candidates = [c for c in sales.columns if "final invoice amount" in str(c).lower()]
     if not invoice_candidates:
         raise ValueError(
@@ -265,7 +251,6 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
         )
     col_invoice = invoice_candidates[0]
 
-    # Price before discount
     col_price_before = None
     for c in sales.columns:
         if "price before discount" in str(c).lower():
@@ -289,13 +274,13 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     else:
         df["Price Before Discount"] = 0.0
 
-    # ---------- keep only Sale + Return ----------
+    # keep only Sale + Return
     df = df[df["Event Sub Type"].str.lower().isin(["sale", "return"])]
 
-    # ---------- detect / normalize Order Item ID (text + ') ----------
+    # detect / normalize Order Item ID
     ensure_order_item_id_column_sales(df)
 
-    # ---------- Return rows negative ----------
+    # return rows negative
     df["IsReturn"] = df["Event Sub Type"].str.lower().eq("return")
     df.loc[df["IsReturn"], "Item Quantity"] *= -1
     df.loc[df["IsReturn"], "Invoice Amount"] *= -1
@@ -412,37 +397,71 @@ def main():
             set_raw, set_pivot, set_summary = process_multiple_orders_cached([f.getvalue() for f in settlement_files])
             sale_raw, sale_pivot, sale_summary = process_multiple_sales_cached([f.getvalue() for f in sales_files])
 
+            # ---------- Robust merge & safe metrics / final view ----------
+
+            # Detect presence of Order Item ID on both sides
             left_has_oi = "Order Item ID" in set_pivot.columns
             right_has_oi = "Order Item ID" in sale_pivot.columns
 
+            # Build merge columns dynamically based on what's present in each pivot
             if left_has_oi and right_has_oi:
-                # Map on Order Item ID + SKU
+                # both sides have Order Item ID -> merge on that + SKU
+                left_merge_cols = ["Order Item ID", "Seller SKU", "Settlement_Qty", "Payment_Received"]
+                right_merge_on = ["Order Item ID", "SKU"]
+                left_merge_on = ["Order Item ID", "Seller SKU"]
                 mapping = sale_pivot.merge(
-                    set_pivot[["Order Item ID", "Seller SKU", "Settlement_Qty", "Payment_Received"]],
-                    left_on=["Order Item ID", "SKU"],
-                    right_on=["Order Item ID", "Seller SKU"],
+                    set_pivot[left_merge_cols],
+                    left_on=right_merge_on,
+                    right_on=left_merge_on,
                     how="left",
                 )
             else:
-                # fallback to Order ID + SKU
-                mapping = sale_pivot.merge(
-                    set_pivot[["Order ID", "Seller SKU", "Settlement_Qty", "Payment_Received"]],
-                    left_on=["Order ID", "SKU"],
-                    right_on=["Order ID", "Seller SKU"],
-                    how="left",
-                )
+                # fallback: try Order ID + SKU. But check columns exist first.
+                left_id_col = "Order ID" if "Order ID" in set_pivot.columns else ("Order Item ID" if "Order Item ID" in set_pivot.columns else None)
+                right_id_col = "Order ID" if "Order ID" in sale_pivot.columns else ("Order Item ID" if "Order Item ID" in sale_pivot.columns else None)
+
+                set_tmp = set_pivot.copy()
+                sale_tmp = sale_pivot.copy()
+
+                if left_id_col and left_id_col != "Order ID":
+                    set_tmp = set_tmp.rename(columns={left_id_col: "Order ID"})
+                if right_id_col and right_id_col != "Order ID":
+                    sale_tmp = sale_tmp.rename(columns={right_id_col: "Order ID"})
+
+                if "Seller SKU" not in set_tmp.columns:
+                    possible = [c for c in set_tmp.columns if "sku" in str(c).lower()]
+                    if possible:
+                        set_tmp = set_tmp.rename(columns={possible[0]: "Seller SKU"})
+
+                left_cols_for_merge = [c for c in ["Order ID", "Seller SKU", "Settlement_Qty", "Payment_Received"] if c in set_tmp.columns]
+                right_on = ["Order ID", "SKU"]
+                left_on = ["Order ID", "Seller SKU"]
+                if "Seller SKU" not in set_tmp.columns or "SKU" not in sale_tmp.columns:
+                    mapping = sale_tmp.merge(
+                        set_tmp[left_cols_for_merge],
+                        left_on=["Order ID"],
+                        right_on=["Order ID"],
+                        how="left",
+                    )
+                else:
+                    mapping = sale_tmp.merge(
+                        set_tmp[left_cols_for_merge],
+                        left_on=right_on,
+                        right_on=left_on,
+                        how="left",
+                    )
 
             mapping = mapping.drop(columns=["Seller SKU"], errors="ignore")
-            mapping["Settlement_Qty"] = mapping["Settlement_Qty"].fillna(0)
-            mapping["Payment_Received"] = mapping["Payment_Received"].fillna(0.0)
+
+            mapping["Settlement_Qty"] = mapping.get("Settlement_Qty", pd.Series(0, index=mapping.index)).fillna(0)
+            mapping["Payment_Received"] = mapping.get("Payment_Received", pd.Series(0.0, index=mapping.index)).fillna(0.0)
 
             mapping["Qty_Diff (Settlement - Sale)"] = mapping["Settlement_Qty"] - mapping["Item Quantity"]
 
             mapping["Amount_Diff (Settlement - Invoice)"] = mapping["Payment_Received"] - mapping["Invoice Amount"]
 
-            mapping["Payment received agaist this Amount"] = mapping["Price Before Discount"]
+            mapping["Payment received agaist this Amount"] = mapping.get("Price Before Discount", 0.0)
 
-            # Cost merge
             if cost_file is not None:
                 cost_df = process_cost_file_cached(cost_file.getvalue())
                 mapping = mapping.merge(cost_df, on="SKU", how="left")
@@ -450,23 +469,27 @@ def main():
             else:
                 mapping["Cost Price"] = 0.0
 
-            # Adjusted cost rules
             mapping["Cost Price Adjusted"] = mapping["Cost Price"]
             mask_return = mapping["Item Quantity"] < 0
-            mapping.loc[mask_return, "Cost Price Adjusted"] *= 0.5
+            mapping.loc[mask_return, "Cost Price Adjusted"] = mapping.loc[mask_return, "Cost Price"] * 0.5
             mask_zero = mapping["Item Quantity"] == 0
-            mapping.loc[mask_zero, "Cost Price Adjusted"] *= 0.2
+            mapping.loc[mask_zero, "Cost Price Adjusted"] = mapping.loc[mask_zero, "Cost Price"] * 0.2
             mapping["Total Cost (Qty * Adjusted Cost)"] = mapping["Item Quantity"] * mapping["Cost Price Adjusted"]
             mapping["Total Cost (Qty * Cost)"] = mapping["Total Cost (Qty * Adjusted Cost)"]
 
-            # ---------- Summary metrics ----------
-            st.subheader("Summary")
+            # ---------- Safe dashboard metrics ----------
             total_rows = mapping.shape[0]
-            unique_orders = mapping["Order ID"].nunique() if "Order ID" in mapping.columns else mapping.shape[0]
-            unique_skus = mapping["SKU"].nunique()
-            total_invoice = mapping["Invoice Amount"].sum()
-            total_payment = mapping["Payment_Received"].sum()
-            total_cost = mapping["Total Cost (Qty * Cost)"].sum()
+            if "Order ID" in mapping.columns:
+                unique_orders = mapping["Order ID"].nunique()
+            elif "Order Item ID" in mapping.columns:
+                unique_orders = mapping["Order Item ID"].nunique()
+            else:
+                unique_orders = mapping.shape[0]
+
+            unique_skus = mapping["SKU"].nunique() if "SKU" in mapping.columns else 0
+            total_invoice = mapping["Invoice Amount"].sum() if "Invoice Amount" in mapping.columns else 0.0
+            total_payment = mapping["Payment_Received"].sum() if "Payment_Received" in mapping.columns else 0.0
+            total_cost = mapping["Total Cost (Qty * Cost)"].sum() if "Total Cost (Qty * Cost)" in mapping.columns else 0.0
 
             c1, c2, c3 = st.columns(3)
             c1.metric("Rows (Order+SKU)", total_rows)
@@ -478,7 +501,7 @@ def main():
             c6.metric("Total Settlement Payment", f"{total_payment:,.2f}")
             c7.metric("Total Cost (adjusted, filtered)", f"{total_cost:,.2f}")
 
-            # Royalty rules
+            # ---------- consolidated royalty ----------
             royalty_rules = {
                 "MKUC": 0.10,
                 "DKUC": 0.10,
@@ -489,24 +512,23 @@ def main():
             }
             total_royalty = 0.0
             for prefix, rate in royalty_rules.items():
-                mask = mapping["SKU"].astype(str).str.upper().str.startswith(prefix)
-                net_invoice = mapping.loc[mask, "Invoice Amount"].sum()
+                mask = mapping.get("SKU", pd.Series([], index=mapping.index)).astype(str).str.upper().str.startswith(prefix)
+                net_invoice = mapping.loc[mask, "Invoice Amount"].sum() if "Invoice Amount" in mapping.columns else 0.0
                 net_positive = net_invoice if net_invoice > 0 else 0.0
                 total_royalty += net_positive * rate
 
-            st.markdown("")
             st.metric("Total Royalty (dashboard only)", f"{total_royalty:,.2f}")
 
             net_settlement_after = total_payment - total_cost - total_royalty
-            st.markdown("")
             st.metric("Net Settlement after Cost & Royalty (dashboard only)", f"{net_settlement_after:,.2f}")
 
             st.markdown("---")
 
+            # ---------- Safe final view selection ----------
             final_cols = [
                 "Order Date",
                 "Order Item ID" if "Order Item ID" in mapping.columns else None,
-                "Order ID",
+                "Order ID" if "Order ID" in mapping.columns else None,
                 "SKU",
                 "Item Quantity",
                 "Invoice Amount",
