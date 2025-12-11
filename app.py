@@ -38,9 +38,11 @@ def normalize_order_item_id(series: pd.Series) -> pd.Series:
     return s_final
 
 def ensure_order_item_id_column_settlement(df: pd.DataFrame, original_columns):
+    # DIRECTLY CHECK COLUMN I (Index 8) AS PER USER FILE
     col_i_idx = excel_col_to_idx("I")
     if len(original_columns) > col_i_idx:
         target_col = original_columns[col_i_idx]
+        # Check if the column at Index 8 looks like an ID or has correct header name
         if target_col in df.columns:
             df["Order Item ID"] = normalize_order_item_id(df[target_col])
             return target_col
@@ -104,6 +106,7 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
                 col_bank_value = c
                 break
     if col_bank_value is None:
+        # FALLBACK TO COLUMN D (Index 3) as per provided file structure
         if len(orders.columns) >= 4:
             col_bank_value = orders.columns[3]
         else:
@@ -138,7 +141,16 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     df["Order ID"] = df[col_order_id].astype(str).str.strip()
     df["Seller SKU"] = df[col_seller_sku].astype(str).str.strip()
     df["Settlement Qty"] = pd.to_numeric(df[col_qty], errors="coerce").fillna(0)
-    df["Payment Received"] = pd.to_numeric(df[col_bank_value], errors="coerce").fillna(0)
+    
+    # SAFE NUMERIC CONVERSION FOR PAYMENT RECEIVED
+    # Handles strings with commas or other formatting issues
+    df["Payment Received"] = (
+        df[col_bank_value]
+        .astype(str)
+        .str.replace(",", "")
+        .apply(pd.to_numeric, errors="coerce")
+        .fillna(0)
+    )
 
     keep_cols = ["Order ID", "Seller SKU", "Settlement Qty", "Payment Received"]
     if "Order Item ID" in df.columns:
@@ -152,26 +164,20 @@ def summarize_orders(df_clean: pd.DataFrame):
     # Determine grouping columns. Prioritize Order Item ID.
     if "Order Item ID" in df_clean.columns:
         # Group ONLY by Order Item ID to ensure 1-to-1 match with Sales Report
-        # This aggregates multiple rows if they have the same Order Item ID (e.g. split payments)
         group_cols = ["Order Item ID"]
     else:
         group_cols = ["Order ID", "Seller SKU"]
 
-    # Include Seller SKU in aggregation only if grouping by Order ID, or handle it separately
-    # For the "Order Item ID" match requested, we mainly care about amounts.
-    
     pivot = (
         df_clean.groupby(group_cols, as_index=False)
         .agg(
             Settlement_Qty=("Settlement Qty", "sum"),
             Payment_Received=("Payment Received", "sum"),
-            # Keep the first SKU found for reference if grouping by ID
             Seller_SKU=("Seller SKU", "first") 
         )
         .reset_index(drop=True)
     )
     
-    # Rename for consistency
     if "Seller_SKU" in pivot.columns:
          pivot = pivot.rename(columns={"Seller_SKU": "Seller SKU"})
 
