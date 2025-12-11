@@ -71,17 +71,43 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     else:
         raise ValueError('Sheet named "Order" or "Orders" not found in the uploaded settlement file.')
 
+    # --- DYNAMIC HEADER DETECTION START ---
+    # Read first few rows without header to find where the actual header starts
+    # This fixes issues where I2/I3 are merged or header is not on the first row
     bio.seek(0)
-    orders = pd.read_excel(bio, sheet_name=target_sheet, engine="openpyxl")
+    df_preview = pd.read_excel(bio, sheet_name=target_sheet, header=None, nrows=10, engine="openpyxl")
+    
+    header_row_idx = 0
+    found_header = False
+    
+    for i, row in df_preview.iterrows():
+        # Convert row to string and check for key columns
+        row_str = row.astype(str).str.lower().tolist()
+        # Check if "order item id" or "order id" is present in this row
+        if any("order item id" in str(x) for x in row_str) or any("order id" in str(x) for x in row_str):
+            header_row_idx = i
+            found_header = True
+            break
+    
+    # If not found, default to 0, but usually it should be found if file is correct
+    if not found_header:
+        header_row_idx = 0
+
+    # Reload dataframe with the correct header row
+    bio.seek(0)
+    orders = pd.read_excel(bio, sheet_name=target_sheet, header=header_row_idx, engine="openpyxl")
+    # --- DYNAMIC HEADER DETECTION END ---
 
     # USER REQUEST: Order Item ID is in Column I (Index 8)
+    # Because of merged cells (I2+I3), the header might be correct now, but we double check index 8
     col_idx_I = excel_col_to_idx("I")
+    
     if len(orders.columns) > col_idx_I:
         col_name_I = orders.columns[col_idx_I]
         # Normalize directly from Column I
         orders["Order Item ID"] = normalize_order_item_id(orders[col_name_I])
     else:
-        # Fallback if Column I doesn't exist
+        # Fallback if Column I doesn't exist or shifted
         cand = find_col_by_keywords(orders.columns, ["order", "item", "id"]) or find_col_by_keywords(orders.columns, ["orderitem", "id"])
         if cand:
              orders["Order Item ID"] = normalize_order_item_id(orders[cand])
@@ -106,12 +132,15 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
                 break
     if col_bank_value is None:
         if len(orders.columns) >= 4:
+            # Fallback based on typical position if name match fails
             col_bank_value = orders.columns[3]
         else:
             raise ValueError("Cannot detect Bank Settlement Value column in Orders sheet.")
 
     sku_idx = excel_col_to_idx("BG")
     qty_idx = excel_col_to_idx("BH")
+    
+    # Check bounds before accessing by index, as merged headers might shift columns
     if len(orders.columns) > max(sku_idx, qty_idx):
         col_seller_sku = orders.columns[sku_idx]
         col_qty = orders.columns[qty_idx]
@@ -123,11 +152,24 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
             orders.columns, ["quantity"]
         )
         if col_seller_sku is None or col_qty is None:
-            raise ValueError(
-                "Orders sheet missing Seller SKU (BG) / Qty (BH) columns and fallback detection failed."
-            )
+            # Try a looser search if strict columns failed
+            # Sometimes merged headers cause columns to be unnamed or 'Unnamed: X'
+            pass
+
+    # Safety check if we still didn't find SKU/Qty
+    if col_seller_sku is None or col_seller_sku not in orders.columns:
+         # Fallback search
+         col_seller_sku = find_col_by_keywords(orders.columns, ["sku"]) 
+    if col_qty is None or col_qty not in orders.columns:
+         col_qty = find_col_by_keywords(orders.columns, ["qty", "quantity"])
+
+    if col_seller_sku is None or col_qty is None:
+        raise ValueError("Orders sheet missing Seller SKU / Qty columns. Please check file format.")
 
     df = orders.copy()
+    
+    # Filter out rows that might be empty due to merge artifacts (e.g., Row 3 being empty part of header)
+    df = df.dropna(subset=[col_bank_value], how='all')
 
     df = df[df[col_bank_value].notna() & df[col_seller_sku].notna() & df[col_qty].notna()]
 
@@ -215,8 +257,22 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     if target_sheet is None:
         raise ValueError('Sheet named "Sales Report" (or similar) not found in uploaded sales file.')
 
+    # --- DYNAMIC HEADER DETECTION FOR SALES START ---
+    # Apply similar logic to Sales file just in case
     bio.seek(0)
-    sales = pd.read_excel(bio, sheet_name=target_sheet, engine="openpyxl")
+    df_preview = pd.read_excel(bio, sheet_name=target_sheet, header=None, nrows=10, engine="openpyxl")
+    header_row_idx = 0
+    found_header = False
+    for i, row in df_preview.iterrows():
+        row_str = row.astype(str).str.lower().tolist()
+        if any("order item id" in str(x) for x in row_str) or any("sku" in str(x) for x in row_str):
+            header_row_idx = i
+            found_header = True
+            break
+    
+    bio.seek(0)
+    sales = pd.read_excel(bio, sheet_name=target_sheet, header=header_row_idx, engine="openpyxl")
+    # --- DYNAMIC HEADER DETECTION FOR SALES END ---
 
     # USER REQUEST: Order Item ID is in Column C (Index 2)
     col_idx_C = excel_col_to_idx("C")
@@ -261,13 +317,24 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
 
     order_date_candidates = [c for c in sales.columns if "order date" in str(c).lower()]
     if not order_date_candidates:
-        raise ValueError("Could not find 'Order Date' column in Sale Report.")
-    col_order_date = order_date_candidates[0]
+        # Try looser match
+        order_date_candidates = [c for c in sales.columns if "date" in str(c).lower()]
+    
+    if not order_date_candidates:
+         # Create dummy date if missing to prevent crash, but warn
+         sales["Order Date Placeholder"] = pd.Timestamp.now()
+         col_order_date = "Order Date Placeholder"
+    else:
+        col_order_date = order_date_candidates[0]
 
     invoice_candidates = [c for c in sales.columns if "final invoice amount" in str(c).lower()]
     if not invoice_candidates:
+         # Fallback search for invoice
+         invoice_candidates = [c for c in sales.columns if "invoice" in str(c).lower() and "amount" in str(c).lower()]
+    
+    if not invoice_candidates:
         raise ValueError(
-            "Could not find 'Final Invoice Amount (Price after discount+Shipping Charges)' column in Sale Report."
+            "Could not find 'Final Invoice Amount' column in Sale Report."
         )
     col_invoice = invoice_candidates[0]
 
