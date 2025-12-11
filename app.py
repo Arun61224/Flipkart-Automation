@@ -26,24 +26,6 @@ def find_col_by_keywords(cols, keywords):
     return None
 
 
-def find_18digit_column(df: pd.DataFrame):
-    """Detect a column where many values look like 18+ digit numeric IDs."""
-    candidate = None
-    best_score = 0
-    pattern = re.compile(r"^\d{18,}$")  # 18 or more digits
-    for c in df.columns:
-        s = df[c].dropna().astype(str).str.strip()
-        if s.empty:
-            continue
-        # Remove potential existing quotes for detection
-        s_clean = s.str.replace(r"^'+", "", regex=True)
-        match_frac = (s_clean.str.match(pattern)).mean()
-        if match_frac > best_score and match_frac >= 0.2:  # >=20% rows look like ID
-            best_score = match_frac
-            candidate = c
-    return candidate
-
-
 def normalize_order_item_id(series: pd.Series) -> pd.Series:
     """
     Convert Order Item ID series to TEXT-like string.
@@ -73,34 +55,6 @@ def normalize_order_item_id(series: pd.Series) -> pd.Series:
     return s_final
 
 
-def ensure_order_item_id_column_settlement(df: pd.DataFrame):
-    """Detect Order Item ID column in settlement df and create normalized 'Order Item ID'."""
-    cand = find_col_by_keywords(df.columns, ["order", "item", "id"])
-    if cand is None:
-        cand = find_col_by_keywords(df.columns, ["orderitem", "id"])
-    if cand is None:
-        cand = find_18digit_column(df)
-
-    if cand is not None:
-        # Normalize immediately to ensure consistent merging key
-        df["Order Item ID"] = normalize_order_item_id(df[cand])
-    return cand
-
-
-def ensure_order_item_id_column_sales(df: pd.DataFrame):
-    """Detect Order Item ID column in sales df and create normalized 'Order Item ID'."""
-    cand = find_col_by_keywords(df.columns, ["order", "item", "id"])
-    if cand is None:
-        cand = find_col_by_keywords(df.columns, ["orderitem", "id"])
-    if cand is None:
-        cand = find_18digit_column(df)
-
-    if cand is not None:
-        # Normalize immediately to ensure consistent merging key
-        df["Order Item ID"] = normalize_order_item_id(df[cand])
-    return cand
-
-
 # ======================================================
 #   PART 1 – SETTLEMENT FILES (Orders sheet)
 # ======================================================
@@ -108,12 +62,31 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     bio = BytesIO(file_bytes)
     xls = pd.ExcelFile(bio)
 
-    if "Orders" not in xls.sheet_names:
-        raise ValueError('Sheet named "Orders" not found in the uploaded settlement file.')
+    # USER REQUEST: Look for "Order" sheet (or "Orders" as fallback)
+    target_sheet = None
+    if "Order" in xls.sheet_names:
+        target_sheet = "Order"
+    elif "Orders" in xls.sheet_names:
+        target_sheet = "Orders"
+    else:
+        raise ValueError('Sheet named "Order" or "Orders" not found in the uploaded settlement file.')
 
     bio.seek(0)
-    orders = pd.read_excel(bio, sheet_name="Orders", engine="openpyxl")
+    orders = pd.read_excel(bio, sheet_name=target_sheet, engine="openpyxl")
 
+    # USER REQUEST: Order Item ID is in Column I (Index 8)
+    col_idx_I = excel_col_to_idx("I")
+    if len(orders.columns) > col_idx_I:
+        col_name_I = orders.columns[col_idx_I]
+        # Normalize directly from Column I
+        orders["Order Item ID"] = normalize_order_item_id(orders[col_name_I])
+    else:
+        # Fallback if Column I doesn't exist
+        cand = find_col_by_keywords(orders.columns, ["order", "item", "id"]) or find_col_by_keywords(orders.columns, ["orderitem", "id"])
+        if cand:
+             orders["Order Item ID"] = normalize_order_item_id(orders[cand])
+
+    # Detect other columns
     col_order_id = (
         find_col_by_keywords(orders.columns, ["transaction", "summary"])
         or find_col_by_keywords(orders.columns, ["order", "id"])
@@ -155,9 +128,6 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
             )
 
     df = orders.copy()
-
-    # 1. Detect and Normalize Order Item ID (adds ' prefix)
-    ensure_order_item_id_column_settlement(df)
 
     df = df[df[col_bank_value].notna() & df[col_seller_sku].notna() & df[col_qty].notna()]
 
@@ -228,16 +198,37 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     xls = pd.ExcelFile(bio)
 
     target_sheet = None
+    # USER REQUEST: Look for "Sales Report" sheet specifically
     for s in xls.sheet_names:
-        chk = s.lower().replace(" ", "")
-        if "sale" in chk and "report" in chk:
+        if s.strip().lower() == "sales report":
             target_sheet = s
             break
+    
+    # Fallback to fuzzy match if exact match not found
     if target_sheet is None:
-        raise ValueError('Sale Report sheet not found in uploaded sales file.')
+        for s in xls.sheet_names:
+            chk = s.lower().replace(" ", "")
+            if "sale" in chk and "report" in chk:
+                target_sheet = s
+                break
+                
+    if target_sheet is None:
+        raise ValueError('Sheet named "Sales Report" (or similar) not found in uploaded sales file.')
 
     bio.seek(0)
     sales = pd.read_excel(bio, sheet_name=target_sheet, engine="openpyxl")
+
+    # USER REQUEST: Order Item ID is in Column C (Index 2)
+    col_idx_C = excel_col_to_idx("C")
+    if len(sales.columns) > col_idx_C:
+        col_name_C = sales.columns[col_idx_C]
+        # Normalize directly from Column C
+        sales["Order Item ID"] = normalize_order_item_id(sales[col_name_C])
+    else:
+        # Fallback detection
+        cand = find_col_by_keywords(sales.columns, ["order", "item", "id"]) or find_col_by_keywords(sales.columns, ["orderitem", "id"])
+        if cand:
+            sales["Order Item ID"] = normalize_order_item_id(sales[cand])
 
     order_idx = excel_col_to_idx("B")
     sku_idx = excel_col_to_idx("F")
@@ -292,6 +283,10 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
 
     df = sales[cols].copy()
 
+    # Pass Order Item ID to the filtered df if it exists
+    if "Order Item ID" in sales.columns:
+        df["Order Item ID"] = sales["Order Item ID"]
+
     df["Order Date"] = pd.to_datetime(df[col_order_date], errors="coerce")
     df["Order ID"] = df[col_order].astype(str).str.strip()
     df["SKU"] = df[col_sku].apply(clean_sku_text)
@@ -305,9 +300,6 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
 
     # keep only Sale + Return
     df = df[df["Event Sub Type"].str.lower().isin(["sale", "return"])]
-
-    # 1. Detect and Normalize Order Item ID (adds ' prefix)
-    ensure_order_item_id_column_sales(df)
 
     # return rows negative
     df["IsReturn"] = df["Event Sub Type"].str.lower().eq("return")
