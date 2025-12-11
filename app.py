@@ -149,19 +149,32 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     return df_clean
 
 def summarize_orders(df_clean: pd.DataFrame):
+    # Determine grouping columns. Prioritize Order Item ID.
     if "Order Item ID" in df_clean.columns:
-        group_cols = ["Order Item ID", "Seller SKU"]
+        # Group ONLY by Order Item ID to ensure 1-to-1 match with Sales Report
+        # This aggregates multiple rows if they have the same Order Item ID (e.g. split payments)
+        group_cols = ["Order Item ID"]
     else:
         group_cols = ["Order ID", "Seller SKU"]
 
+    # Include Seller SKU in aggregation only if grouping by Order ID, or handle it separately
+    # For the "Order Item ID" match requested, we mainly care about amounts.
+    
     pivot = (
         df_clean.groupby(group_cols, as_index=False)
         .agg(
             Settlement_Qty=("Settlement Qty", "sum"),
             Payment_Received=("Payment Received", "sum"),
+            # Keep the first SKU found for reference if grouping by ID
+            Seller_SKU=("Seller SKU", "first") 
         )
         .reset_index(drop=True)
     )
+    
+    # Rename for consistency
+    if "Seller_SKU" in pivot.columns:
+         pivot = pivot.rename(columns={"Seller_SKU": "Seller SKU"})
+
     summary = {
         "rows": df_clean.shape[0],
         "orders": df_clean["Order ID"].nunique() if "Order ID" in df_clean.columns else df_clean.shape[0],
@@ -386,13 +399,12 @@ def main():
             right_has_oi = "Order Item ID" in sale_pivot.columns
 
             if left_has_oi and right_has_oi:
-                left_merge_cols = ["Order Item ID", "Seller SKU", "Settlement_Qty", "Payment_Received"]
-                right_merge_on = ["Order Item ID", "SKU"]
-                left_merge_on = ["Order Item ID", "Seller SKU"]
+                # DIRECT MATCH LOGIC AS REQUESTED:
+                # Match ONLY on Order Item ID.
+                # Settlement data is already aggregated by Order Item ID in summarize_orders if present.
                 mapping = sale_pivot.merge(
-                    set_pivot[left_merge_cols],
-                    left_on=right_merge_on,
-                    right_on=left_merge_on,
+                    set_pivot[["Order Item ID", "Settlement_Qty", "Payment_Received"]],
+                    on="Order Item ID",
                     how="left",
                 )
             else:
