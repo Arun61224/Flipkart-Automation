@@ -2,6 +2,7 @@
 import re
 import streamlit as st
 import pandas as pd
+import numpy as np
 from io import BytesIO
 
 # -----------------------
@@ -34,7 +35,9 @@ def find_18digit_column(df: pd.DataFrame):
         s = df[c].dropna().astype(str).str.strip()
         if s.empty:
             continue
-        match_frac = (s.str.match(pattern)).mean()
+        # Remove potential existing quotes for detection
+        s_clean = s.str.replace(r"^'+", "", regex=True)
+        match_frac = (s_clean.str.match(pattern)).mean()
         if match_frac > best_score and match_frac >= 0.2:  # >=20% rows look like ID
             best_score = match_frac
             candidate = c
@@ -43,11 +46,31 @@ def find_18digit_column(df: pd.DataFrame):
 
 def normalize_order_item_id(series: pd.Series) -> pd.Series:
     """
-    Convert Order Item ID series to TEXT-like string, remove trailing .0, and prefix with '.
+    Convert Order Item ID series to TEXT-like string.
+    1. Convert to string.
+    2. Remove scientific notation artifacts (.0).
+    3. Remove existing quotes to avoid double quoting.
+    4. Add ' prefix to force exact text matching and Excel text format.
     """
+    # Convert to string
     s = series.astype(str).str.strip()
+    
+    # Handle NaNs (astype(str) converts NaN to 'nan')
+    is_nan = s.str.lower() == 'nan'
+    
+    # Remove .0 if it exists (e.g. from float conversion)
     s = s.str.replace(r"\.0$", "", regex=True)
-    return "'" + s
+    
+    # Remove existing single quotes if any (to avoid ''ID)
+    s = s.str.replace(r"^'+", "", regex=True)
+    
+    # Add the single quote prefix
+    s_final = "'" + s
+    
+    # Restore NaNs so we don't have "'nan"
+    s_final[is_nan] = np.nan
+    
+    return s_final
 
 
 def ensure_order_item_id_column_settlement(df: pd.DataFrame):
@@ -59,6 +82,7 @@ def ensure_order_item_id_column_settlement(df: pd.DataFrame):
         cand = find_18digit_column(df)
 
     if cand is not None:
+        # Normalize immediately to ensure consistent merging key
         df["Order Item ID"] = normalize_order_item_id(df[cand])
     return cand
 
@@ -72,6 +96,7 @@ def ensure_order_item_id_column_sales(df: pd.DataFrame):
         cand = find_18digit_column(df)
 
     if cand is not None:
+        # Normalize immediately to ensure consistent merging key
         df["Order Item ID"] = normalize_order_item_id(df[cand])
     return cand
 
@@ -131,6 +156,7 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
 
     df = orders.copy()
 
+    # 1. Detect and Normalize Order Item ID (adds ' prefix)
     ensure_order_item_id_column_settlement(df)
 
     df = df[df[col_bank_value].notna() & df[col_seller_sku].notna() & df[col_qty].notna()]
@@ -145,6 +171,9 @@ def process_orders_excel_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     keep_cols = ["Order ID", "Seller SKU", "Settlement Qty", "Payment Received"]
     if "Order Item ID" in df.columns:
         keep_cols.insert(1, "Order Item ID")
+        # Ensure it's treated as string and kept safe
+        df = df[df["Order Item ID"].notna()]
+        
     df_clean = df[keep_cols].copy()
 
     return df_clean
@@ -277,7 +306,7 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     # keep only Sale + Return
     df = df[df["Event Sub Type"].str.lower().isin(["sale", "return"])]
 
-    # detect / normalize Order Item ID
+    # 1. Detect and Normalize Order Item ID (adds ' prefix)
     ensure_order_item_id_column_sales(df)
 
     # return rows negative
@@ -296,6 +325,9 @@ def load_single_sales_df_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     cols_return = ["Order Date", "Order ID", "SKU", "Item Quantity", "Invoice Amount", "Price Before Discount"]
     if "Order Item ID" in df.columns:
         cols_return.insert(1, "Order Item ID")
+        # Ensure safe
+        df = df[df["Order Item ID"].notna()]
+        
     return df[cols_return]
 
 
@@ -403,9 +435,9 @@ def main():
             left_has_oi = "Order Item ID" in set_pivot.columns
             right_has_oi = "Order Item ID" in sale_pivot.columns
 
-            # Build merge columns dynamically based on what's present in each pivot
+            # Force usage of Order Item ID if available, as requested
             if left_has_oi and right_has_oi:
-                # both sides have Order Item ID -> merge on that + SKU
+                # MERGE BASED ON Order Item ID (Normalized with ' prefix)
                 left_merge_cols = ["Order Item ID", "Seller SKU", "Settlement_Qty", "Payment_Received"]
                 right_merge_on = ["Order Item ID", "SKU"]
                 left_merge_on = ["Order Item ID", "Seller SKU"]
@@ -416,7 +448,8 @@ def main():
                     how="left",
                 )
             else:
-                # fallback: try Order ID + SKU. But check columns exist first.
+                st.warning("Warning: 'Order Item ID' not found in both files. Falling back to 'Order ID'. Match might be less accurate.")
+                # fallback: try Order ID + SKU.
                 left_id_col = "Order ID" if "Order ID" in set_pivot.columns else ("Order Item ID" if "Order Item ID" in set_pivot.columns else None)
                 right_id_col = "Order ID" if "Order ID" in sale_pivot.columns else ("Order Item ID" if "Order Item ID" in sale_pivot.columns else None)
 
