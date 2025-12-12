@@ -221,7 +221,11 @@ class ReconciliationEngine:
                 'Cost Price': 0
             }, inplace=True)
 
-            merged_df['Profit/Loss'] = merged_df['Bank Settlement Value (Rs.)'] - (merged_df['Cost Price'] * merged_df['Item Quantity'])
+            # Calculate Total Cost Price (Unit Cost * Quantity)
+            merged_df['Total Cost Price'] = merged_df['Cost Price'] * merged_df['Item Quantity']
+
+            # Update Profit/Loss to use Total Cost Price
+            merged_df['Profit/Loss'] = merged_df['Bank Settlement Value (Rs.)'] - merged_df['Total Cost Price']
             
             # Identify unmatched rows
             unmatched_rows = merged_df[merged_df['Bank Settlement Value (Rs.)'] == 0]
@@ -233,7 +237,7 @@ class ReconciliationEngine:
             final_columns = [
                 'Order Date', 'Order Item ID', 'SKU', 'Item Quantity', 
                 'Final Invoice Amount', 'Bank Settlement Value (Rs.)', 
-                'Cost Price', 'Profit/Loss'
+                'Cost Price', 'Total Cost Price', 'Profit/Loss'
             ]
             final_columns = [c for c in final_columns if c in merged_df.columns]
             final_output = merged_df[final_columns]
@@ -243,7 +247,8 @@ class ReconciliationEngine:
                 "Matched with Settlement": len(final_output) - len(unmatched_rows),
                 "Unmatched": len(unmatched_rows),
                 "Total Settlement Amount": final_output['Bank Settlement Value (Rs.)'].sum(),
-                "Total Invoice Amount": final_output['Final Invoice Amount'].sum() if 'Final Invoice Amount' in final_output else 0
+                "Total Invoice Amount": final_output['Final Invoice Amount'].sum() if 'Final Invoice Amount' in final_output else 0,
+                "Total Cost Amount": final_output['Total Cost Price'].sum() if 'Total Cost Price' in final_output else 0
             }
 
             return final_output, stats, self.logs
@@ -357,6 +362,7 @@ if st.sidebar.button("Run Reconciliation", type="primary"):
                     st.metric("Total Orders", stats["Total Orders"])
                     st.metric("Total Settlement", f"₹{stats['Total Settlement Amount']:,.2f}")
                     st.metric("Total Invoice Value", f"₹{stats['Total Invoice Amount']:,.2f}")
+                    st.metric("Total Cost", f"₹{stats['Total Cost Amount']:,.2f}")
                 
                 with col2:
                     st.subheader("Match Rate")
