@@ -5,7 +5,53 @@ import re
 import traceback
 
 # ==========================================
-# CORE LOGIC
+# 1. SMART HEADER DETECTION LOGIC
+# ==========================================
+def find_header_row(df, keyword, search_rows=10):
+    """
+    Scans the first 'search_rows' of a dataframe to find the row 
+    that contains the specific keyword. Returns the index of that row.
+    """
+    for idx, row in df.head(search_rows).iterrows():
+        # Convert entire row to string and check for keyword
+        row_str = " ".join(row.astype(str)).lower()
+        if keyword.lower() in row_str:
+            return idx
+    return 0  # Default to first row if not found
+
+def load_files_with_smart_headers(uploaded_files, keyword_for_header, dtype=None):
+    """
+    Reads multiple files, finds the correct header row for EACH file, 
+    and combines them.
+    """
+    if not uploaded_files:
+        return None
+    
+    df_list = []
+    for file in uploaded_files:
+        try:
+            # Step 1: Read raw (no header assumption)
+            # Read first few rows just to find the header
+            raw_df = pd.read_excel(file, sheet_name=0, header=None, nrows=15)
+            
+            # Step 2: Find the row index containing the keyword
+            header_idx = find_header_row(raw_df, keyword_for_header)
+            
+            # Step 3: Reload file using the correct header row
+            file.seek(0) # Reset file pointer
+            df = pd.read_excel(file, sheet_name=0, header=header_idx, dtype=dtype)
+            df_list.append(df)
+            
+        except Exception as e:
+            st.error(f"Error reading file {file.name}: {e}")
+    
+    if df_list:
+        # Concatenate all corrected dataframes
+        return pd.concat(df_list, ignore_index=True)
+    return None
+
+# ==========================================
+# 2. CORE PROCESSING LOGIC
 # ==========================================
 class ReconciliationEngine:
     def __init__(self):
@@ -18,24 +64,23 @@ class ReconciliationEngine:
         if pd.isna(sku):
             return ""
         sku = str(sku)
-        # Remove "SKU:" and triple quotes, then strip whitespace
         sku = re.sub(r'SKU:', '', sku, flags=re.IGNORECASE)
         sku = sku.replace('"""', '')
         return sku.strip()
 
     def find_column_by_substring(self, df, substring):
-        """Finds a column name that contains the substring."""
         for col in df.columns:
-            if substring.lower() in str(col).lower():
+            # Handle newlines in headers by replacing \n with space
+            col_clean = str(col).replace("\n", " ").strip()
+            if substring.lower() in col_clean.lower():
                 return col
         return None
 
-    # Ab ye function direct DataFrames leta hai, files nahi
     def process(self, sales_df, settlement_df, cost_df, auto_clean_sku=True, handle_merged=True):
-        self.logs = [] # Reset logs
+        self.logs = [] 
         
         try:
-            # 1. PROCESS SALES REPORT
+            # --- 1. PROCESS SALES REPORT ---
             if sales_df is None or sales_df.empty:
                  return None, None, ["Error: No Sales Data provided."]
 
@@ -48,10 +93,16 @@ class ReconciliationEngine:
                 'Final Invoice Amount (Price after discount+Shipping Charges)': 'Final Invoice Amount'
             }
             
-            # Normalize headers
-            sales_df.columns = [str(c).strip() for c in sales_df.columns]
+            # Clean Headers (remove newlines/spaces)
+            sales_df.columns = [str(c).strip().replace("\n", " ") for c in sales_df.columns]
             
-            # Rename columns if they exist
+            # Check for missing crucial columns
+            if 'Order Item ID' not in sales_df.columns:
+                # Try finding it fuzzy
+                found_col = self.find_column_by_substring(sales_df, "Order Item ID")
+                if found_col:
+                    sales_df.rename(columns={found_col: 'Order Item ID'}, inplace=True)
+            
             sales_df.rename(columns=sales_cols_map, inplace=True)
             
             # Data Type Conversion
@@ -60,32 +111,29 @@ class ReconciliationEngine:
             if 'Final Invoice Amount' in sales_df.columns:
                 sales_df['Final Invoice Amount'] = pd.to_numeric(sales_df['Final Invoice Amount'], errors='coerce').fillna(0)
 
-            # CLEAN SKU
             if auto_clean_sku and 'SKU' in sales_df.columns:
                 sales_df['SKU'] = sales_df['SKU'].apply(self.clean_sku)
 
-            # 2. PROCESS SETTLEMENT REPORT
+            # --- 2. PROCESS SETTLEMENT REPORT ---
             if settlement_df is None or settlement_df.empty:
                 self.log("Error: No Settlement Data provided.")
                 return None, None, self.logs
 
-            # Handle Merged Cells (Forward Fill)
             if handle_merged:
                 settlement_df = settlement_df.ffill() 
 
-            # Identify "Bank Settlement Value" column
+            # Identify "Bank Settlement Value" column (Robust Search)
             bsv_col = self.find_column_by_substring(settlement_df, "Bank Settlement Value")
+            
             if not bsv_col:
-                # Fallback logic
-                if len(settlement_df.columns) > 3:
-                    bsv_col = settlement_df.columns[3]
-                else:
-                    self.log("Error: Could not locate 'Bank Settlement Value' column.")
-                    return None, None, self.logs
+                self.log("Error: Could not locate 'Bank Settlement Value' column.")
+                self.log(f"Available columns found: {list(settlement_df.columns)}")
+                return None, None, self.logs
 
             # Identify "Order Item ID"
             oid_col = self.find_column_by_substring(settlement_df, "Order Item ID")
             if not oid_col:
+                 # Fallback to column index 8 if names fail, but warn
                  if len(settlement_df.columns) > 8:
                     oid_col = settlement_df.columns[8]
             
@@ -93,11 +141,11 @@ class ReconciliationEngine:
             settlement_df[oid_col] = settlement_df[oid_col].astype(str).str.strip()
             settlement_df[bsv_col] = pd.to_numeric(settlement_df[bsv_col], errors='coerce').fillna(0)
 
-            # Aggregate Duplicates (Sum values for same ID)
+            # Aggregate Duplicates
             settlement_agg = settlement_df.groupby(oid_col)[bsv_col].sum().reset_index()
             settlement_agg.rename(columns={bsv_col: 'Bank Settlement Value (Rs.)', oid_col: 'Order Item ID'}, inplace=True)
 
-            # 3. PROCESS COST PRICE
+            # --- 3. PROCESS COST PRICE ---
             if cost_df is not None and not cost_df.empty:
                 cost_df.columns = [str(c).strip() for c in cost_df.columns]
                 if 'SKU' in cost_df.columns and 'Cost Price' in cost_df.columns:
@@ -109,7 +157,7 @@ class ReconciliationEngine:
             else:
                 cost_df = pd.DataFrame(columns=['SKU', 'Cost Price'])
 
-            # 4. MERGING
+            # --- 4. MERGING ---
             if 'Order Item ID' in sales_df.columns:
                 sales_df['Order Item ID'] = sales_df['Order Item ID'].astype(str).str.strip()
                 merged_df = pd.merge(sales_df, settlement_agg, on='Order Item ID', how='left')
@@ -121,7 +169,7 @@ class ReconciliationEngine:
             else:
                 merged_df['Cost Price'] = 0
 
-            # 5. CALCULATIONS
+            # --- 5. CALCULATIONS ---
             merged_df.fillna({
                 'Bank Settlement Value (Rs.)': 0,
                 'Cost Price': 0
@@ -158,27 +206,7 @@ class ReconciliationEngine:
             return None, None, self.logs
 
 # ==========================================
-# HELPER TO READ MULTIPLE FILES
-# ==========================================
-def load_files_into_df(uploaded_files, dtype=None):
-    if not uploaded_files:
-        return None
-    
-    df_list = []
-    for file in uploaded_files:
-        try:
-            # Read 1st sheet (sheet_name=0) to be safe
-            df = pd.read_excel(file, sheet_name=0, dtype=dtype)
-            df_list.append(df)
-        except Exception as e:
-            st.error(f"Error reading file {file.name}: {e}")
-    
-    if df_list:
-        return pd.concat(df_list, ignore_index=True)
-    return None
-
-# ==========================================
-# STREAMLIT UI
+# 3. STREAMLIT UI
 # ==========================================
 
 st.set_page_config(page_title="Flipkart Reconciliation Tool", layout="wide")
@@ -187,7 +215,7 @@ st.title("📊 Flipkart Reconciliation Tool")
 # --- SIDEBAR CONFIGURATION ---
 st.sidebar.header("1. Upload Files")
 
-# 1. SALES UPLOAD (Multiple)
+# 1. SALES UPLOAD
 st.sidebar.subheader("Sales Reports")
 sales_files = st.sidebar.file_uploader(
     "Upload Sales (Multiple allowed)", 
@@ -196,7 +224,7 @@ sales_files = st.sidebar.file_uploader(
     key="sales"
 )
 
-# 2. SETTLEMENT UPLOAD (Multiple)
+# 2. SETTLEMENT UPLOAD
 st.sidebar.subheader("Settlement Reports")
 settlement_files = st.sidebar.file_uploader(
     "Upload Settlement (Multiple allowed)", 
@@ -205,7 +233,7 @@ settlement_files = st.sidebar.file_uploader(
     key="settlement"
 )
 
-# 3. COST UPLOAD (Multiple)
+# 3. COST UPLOAD
 st.sidebar.subheader("SKU Cost")
 cost_files = st.sidebar.file_uploader(
     "Upload SKU Cost (Multiple allowed)", 
@@ -230,15 +258,14 @@ if st.sidebar.button("Run Reconciliation", type="primary"):
         engine = ReconciliationEngine()
         
         with st.spinner("Reading and Combining files..."):
-            # Load and Combine Sales Files
-            # Reading as string to keep IDs safe
-            sales_master_df = load_files_into_df(sales_files, dtype=str)
+            # Load Sales (Look for 'Order Item ID' to identify header row)
+            sales_master_df = load_files_with_smart_headers(sales_files, "Order Item ID", dtype=str)
             
-            # Load and Combine Settlement Files
-            settlement_master_df = load_files_into_df(settlement_files)
+            # Load Settlement (Look for 'Bank Settlement' to identify header row)
+            settlement_master_df = load_files_with_smart_headers(settlement_files, "Bank Settlement Value")
             
-            # Load Cost Files (Optional)
-            cost_master_df = load_files_into_df(cost_files)
+            # Load Cost (Look for 'Cost Price' to identify header row)
+            cost_master_df = load_files_with_smart_headers(cost_files, "Cost Price")
             
             st.info(f"Loaded {len(sales_files)} Sales files, {len(settlement_files)} Settlement files.")
 
