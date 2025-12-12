@@ -96,6 +96,15 @@ class ReconciliationEngine:
         sku = sku.replace('"""', '')
         return sku.strip()
 
+    def clean_id(self, val):
+        if pd.isna(val):
+            return ""
+        val = str(val).strip()
+        # Remove leading apostrophe if present (common in your Merge ST file)
+        if val.startswith("'"):
+            val = val[1:]
+        return val
+
     def find_column_by_substring(self, df, substring):
         for col in df.columns:
             col_clean = str(col).replace("\n", " ").strip()
@@ -130,6 +139,10 @@ class ReconciliationEngine:
             
             sales_df.rename(columns=sales_cols_map, inplace=True)
             
+            # Clean IDs in Sales Report
+            if 'Order Item ID' in sales_df.columns:
+                sales_df['Order Item ID'] = sales_df['Order Item ID'].apply(self.clean_id)
+
             # Clean Data Types
             if 'Item Quantity' in sales_df.columns:
                 sales_df['Item Quantity'] = pd.to_numeric(sales_df['Item Quantity'], errors='coerce').fillna(0)
@@ -139,9 +152,9 @@ class ReconciliationEngine:
             if auto_clean_sku and 'SKU' in sales_df.columns:
                 sales_df['SKU'] = sales_df['SKU'].apply(self.clean_sku)
 
-            # --- 2. PROCESS SETTLEMENT REPORT (WITH PIVOT) ---
+            # --- 2. PROCESS SETTLEMENT REPORT (MERGE ST Logic) ---
             if settlement_df is None or settlement_df.empty:
-                self.log("Error: No valid Settlement Data found. Check if sheet 'Orders' exists.")
+                self.log("Error: No valid Settlement Data found.")
                 return None, None, self.logs
 
             if handle_merged:
@@ -150,7 +163,7 @@ class ReconciliationEngine:
             # Identify "Bank Settlement Value"
             bsv_col = self.find_column_by_substring(settlement_df, "Bank Settlement Value")
             if not bsv_col:
-                bsv_col = self.find_column_by_substring(settlement_df, "Settlement Value") # Fallback
+                bsv_col = self.find_column_by_substring(settlement_df, "Settlement Value")
             
             if not bsv_col:
                 self.log("Error: Could not locate 'Bank Settlement Value' column.")
@@ -160,16 +173,16 @@ class ReconciliationEngine:
             # Identify "Order Item ID" in Settlement
             oid_col_settlement = self.find_column_by_substring(settlement_df, "Order Item ID")
             if not oid_col_settlement:
-                 # Fallback to index 8 if names fail (Common structure)
                  if len(settlement_df.columns) > 8:
                     oid_col_settlement = settlement_df.columns[8]
             
-            # Normalize Settlement Data
-            settlement_df[oid_col_settlement] = settlement_df[oid_col_settlement].astype(str).str.strip()
+            # Normalize Settlement Data & Clean IDs (Remove ' prefix)
+            settlement_df[oid_col_settlement] = settlement_df[oid_col_settlement].apply(self.clean_id)
             settlement_df[bsv_col] = pd.to_numeric(settlement_df[bsv_col], errors='coerce').fillna(0)
 
             # --- PIVOT LOGIC (AGGREGATE DUPLICATES) ---
             # Group by Order Item ID and Sum the Settlement Value
+            # This fixes the "low payout" issue by combining split payments
             settlement_agg = settlement_df.groupby(oid_col_settlement)[bsv_col].sum().reset_index()
             settlement_agg.rename(columns={bsv_col: 'Bank Settlement Value (Rs.)', oid_col_settlement: 'Order Item ID'}, inplace=True)
             
@@ -178,7 +191,6 @@ class ReconciliationEngine:
             # --- 3. PROCESS COST PRICE ---
             if cost_df is not None and not cost_df.empty:
                 cost_df.columns = [str(c).strip() for c in cost_df.columns]
-                # Find SKU and Cost cols fuzzily
                 c_sku = self.find_column_by_substring(cost_df, "SKU")
                 c_price = self.find_column_by_substring(cost_df, "Cost Price")
                 
@@ -194,8 +206,6 @@ class ReconciliationEngine:
 
             # --- 4. MERGING ---
             if 'Order Item ID' in sales_df.columns:
-                sales_df['Order Item ID'] = sales_df['Order Item ID'].astype(str).str.strip()
-                # Left join so we keep all sales, even if settlement is missing
                 merged_df = pd.merge(sales_df, settlement_agg, on='Order Item ID', how='left')
             else:
                  return None, None, ["Error: 'Order Item ID' column missing in Sales Report."]
@@ -213,9 +223,11 @@ class ReconciliationEngine:
 
             merged_df['Profit/Loss'] = merged_df['Bank Settlement Value (Rs.)'] - (merged_df['Cost Price'] * merged_df['Item Quantity'])
             
+            # Identify unmatched rows
             unmatched_rows = merged_df[merged_df['Bank Settlement Value (Rs.)'] == 0]
 
             # Output formatting
+            # Ensure ID is treated as text in Excel
             merged_df['Order Item ID'] = "'" + merged_df['Order Item ID'].astype(str)
 
             final_columns = [
@@ -262,8 +274,9 @@ sales_files = st.sidebar.file_uploader(
 
 # 2. SETTLEMENT UPLOAD
 st.sidebar.subheader("Settlement Reports")
+st.sidebar.info("Upload 'Merge ST.xlsx' or 'Settlement.xlsx' here.")
 settlement_files = st.sidebar.file_uploader(
-    "Upload Settlement (e.g. September ST.xlsx)", 
+    "Upload Settlement Files", 
     type=['xlsx', 'xls'], 
     accept_multiple_files=True,
     key="settlement"
@@ -295,7 +308,7 @@ if st.sidebar.button("Run Reconciliation", type="primary"):
         
         with st.spinner("Analyzing and Reading files..."):
             
-            # 1. Load SALES (Priority Sheet: 'Sales Report', Header Keyword: 'Order Item ID')
+            # 1. Load SALES
             sales_master_df = load_multiple_files(
                 sales_files, 
                 target_sheet_names=["Sales Report", "Sales"], 
@@ -303,14 +316,15 @@ if st.sidebar.button("Run Reconciliation", type="primary"):
                 dtype=str
             )
             
-            # 2. Load SETTLEMENT (Priority Sheet: 'Orders', Header Keyword: 'Bank Settlement Value')
+            # 2. Load SETTLEMENT (Updated for Merge ST file)
+            # Adds "Sheet1" and "Working" to target sheets
             settlement_master_df = load_multiple_files(
                 settlement_files, 
-                target_sheet_names=["Orders", "Settlement"], 
+                target_sheet_names=["Sheet1", "Working", "Orders", "Settlement"], 
                 header_keywords=["Bank Settlement Value", "Settlement Value", "Order Item ID"]
             )
             
-            # 3. Load COST (Priority Sheet: 'Sheet1', Header Keyword: 'Cost Price')
+            # 3. Load COST
             cost_master_df = load_multiple_files(
                 cost_files, 
                 target_sheet_names=["Sheet1", "Cost"], 
