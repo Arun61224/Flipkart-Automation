@@ -5,25 +5,29 @@ import re
 import traceback
 
 # ==========================================
-# 1. SMART HEADER DETECTION LOGIC
+# 1. SMART HEADER DETECTION LOGIC (UPDATED)
 # ==========================================
-def find_header_row(df, keyword, search_rows=10):
+def find_header_row(df, keywords, search_rows=20):
     """
-    Scans the first 'search_rows' of a dataframe to find the row 
-    that contains the specific keyword. Returns the index of that row.
+    Scans the first 'search_rows' to find any of the keywords.
+    Handles newlines (\n) and extra spaces intelligently.
     """
+    # Ensure keywords is a list
+    if isinstance(keywords, str):
+        keywords = [keywords]
+    
     for idx, row in df.head(search_rows).iterrows():
-        # Convert entire row to string and check for keyword
+        # Convert row to a single string, remove newlines, lower case
+        # This converts "Bank Settlement\nValue" -> "bank settlement value"
         row_str = " ".join(row.astype(str)).lower()
-        if keyword.lower() in row_str:
-            return idx
-    return 0  # Default to first row if not found
+        row_str = row_str.replace("\n", " ").replace("  ", " ")
+        
+        for kw in keywords:
+            if kw.lower() in row_str:
+                return idx
+    return None # Return None if not found
 
-def load_files_with_smart_headers(uploaded_files, keyword_for_header, dtype=None):
-    """
-    Reads multiple files, finds the correct header row for EACH file, 
-    and combines them.
-    """
+def load_files_with_smart_headers(uploaded_files, keywords, dtype=None):
     if not uploaded_files:
         return None
     
@@ -31,14 +35,19 @@ def load_files_with_smart_headers(uploaded_files, keyword_for_header, dtype=None
     for file in uploaded_files:
         try:
             # Step 1: Read raw (no header assumption)
-            # Read first few rows just to find the header
-            raw_df = pd.read_excel(file, sheet_name=0, header=None, nrows=15)
+            # Read first 20 rows to find the header
+            raw_df = pd.read_excel(file, sheet_name=0, header=None, nrows=20)
             
-            # Step 2: Find the row index containing the keyword
-            header_idx = find_header_row(raw_df, keyword_for_header)
+            # Step 2: Find the row index
+            header_idx = find_header_row(raw_df, keywords)
+            
+            if header_idx is None:
+                # Fallback: If not found, assume row 0 but warn user
+                st.warning(f"⚠️ Could not find header keywords {keywords} in {file.name}. Using first row.")
+                header_idx = 0
             
             # Step 3: Reload file using the correct header row
-            file.seek(0) # Reset file pointer
+            file.seek(0)
             df = pd.read_excel(file, sheet_name=0, header=header_idx, dtype=dtype)
             df_list.append(df)
             
@@ -46,7 +55,6 @@ def load_files_with_smart_headers(uploaded_files, keyword_for_header, dtype=None
             st.error(f"Error reading file {file.name}: {e}")
     
     if df_list:
-        # Concatenate all corrected dataframes
         return pd.concat(df_list, ignore_index=True)
     return None
 
@@ -96,12 +104,10 @@ class ReconciliationEngine:
             # Clean Headers (remove newlines/spaces)
             sales_df.columns = [str(c).strip().replace("\n", " ") for c in sales_df.columns]
             
-            # Check for missing crucial columns
-            if 'Order Item ID' not in sales_df.columns:
-                # Try finding it fuzzy
-                found_col = self.find_column_by_substring(sales_df, "Order Item ID")
-                if found_col:
-                    sales_df.rename(columns={found_col: 'Order Item ID'}, inplace=True)
+            # Normalize specific columns if found slightly different
+            for col in sales_df.columns:
+                if "Order Item ID" in col:
+                    sales_df.rename(columns={col: 'Order Item ID'}, inplace=True)
             
             sales_df.rename(columns=sales_cols_map, inplace=True)
             
@@ -123,17 +129,20 @@ class ReconciliationEngine:
                 settlement_df = settlement_df.ffill() 
 
             # Identify "Bank Settlement Value" column (Robust Search)
+            # Try multiple variations
             bsv_col = self.find_column_by_substring(settlement_df, "Bank Settlement Value")
+            if not bsv_col:
+                bsv_col = self.find_column_by_substring(settlement_df, "Settlement Value")
             
             if not bsv_col:
                 self.log("Error: Could not locate 'Bank Settlement Value' column.")
-                self.log(f"Available columns found: {list(settlement_df.columns)}")
+                self.log(f"Columns found in file: {list(settlement_df.columns)}")
                 return None, None, self.logs
 
             # Identify "Order Item ID"
             oid_col = self.find_column_by_substring(settlement_df, "Order Item ID")
             if not oid_col:
-                 # Fallback to column index 8 if names fail, but warn
+                 # Fallback to column index 8 if names fail
                  if len(settlement_df.columns) > 8:
                     oid_col = settlement_df.columns[8]
             
@@ -258,14 +267,14 @@ if st.sidebar.button("Run Reconciliation", type="primary"):
         engine = ReconciliationEngine()
         
         with st.spinner("Reading and Combining files..."):
-            # Load Sales (Look for 'Order Item ID' to identify header row)
-            sales_master_df = load_files_with_smart_headers(sales_files, "Order Item ID", dtype=str)
+            # Load Sales (Keyword: Order Item ID)
+            sales_master_df = load_files_with_smart_headers(sales_files, ["Order Item ID", "Order ID"], dtype=str)
             
-            # Load Settlement (Look for 'Bank Settlement' to identify header row)
-            settlement_master_df = load_files_with_smart_headers(settlement_files, "Bank Settlement Value")
+            # Load Settlement (Keyword: Bank Settlement Value OR Settlement Value)
+            settlement_master_df = load_files_with_smart_headers(settlement_files, ["Bank Settlement Value", "Settlement Value"])
             
-            # Load Cost (Look for 'Cost Price' to identify header row)
-            cost_master_df = load_files_with_smart_headers(cost_files, "Cost Price")
+            # Load Cost (Keyword: Cost Price)
+            cost_master_df = load_files_with_smart_headers(cost_files, ["Cost Price", "Cost"])
             
             st.info(f"Loaded {len(sales_files)} Sales files, {len(settlement_files)} Settlement files.")
 
