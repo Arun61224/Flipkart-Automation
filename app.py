@@ -139,7 +139,7 @@ class ReconciliationEngine:
             if auto_clean_sku and 'SKU' in sales_df.columns:
                 sales_df['SKU'] = sales_df['SKU'].apply(self.clean_sku)
 
-            # --- 2. PROCESS SETTLEMENT REPORT ---
+            # --- 2. PROCESS SETTLEMENT REPORT (WITH PIVOT) ---
             if settlement_df is None or settlement_df.empty:
                 self.log("Error: No valid Settlement Data found. Check if sheet 'Orders' exists.")
                 return None, None, self.logs
@@ -168,9 +168,12 @@ class ReconciliationEngine:
             settlement_df[oid_col_settlement] = settlement_df[oid_col_settlement].astype(str).str.strip()
             settlement_df[bsv_col] = pd.to_numeric(settlement_df[bsv_col], errors='coerce').fillna(0)
 
-            # Aggregate Duplicates
+            # --- PIVOT LOGIC (AGGREGATE DUPLICATES) ---
+            # Group by Order Item ID and Sum the Settlement Value
             settlement_agg = settlement_df.groupby(oid_col_settlement)[bsv_col].sum().reset_index()
             settlement_agg.rename(columns={bsv_col: 'Bank Settlement Value (Rs.)', oid_col_settlement: 'Order Item ID'}, inplace=True)
+            
+            self.log(f"Settlement Data Aggregated: {len(settlement_df)} rows reduced to {len(settlement_agg)} unique IDs.")
 
             # --- 3. PROCESS COST PRICE ---
             if cost_df is not None and not cost_df.empty:
@@ -192,6 +195,7 @@ class ReconciliationEngine:
             # --- 4. MERGING ---
             if 'Order Item ID' in sales_df.columns:
                 sales_df['Order Item ID'] = sales_df['Order Item ID'].astype(str).str.strip()
+                # Left join so we keep all sales, even if settlement is missing
                 merged_df = pd.merge(sales_df, settlement_agg, on='Order Item ID', how='left')
             else:
                  return None, None, ["Error: 'Order Item ID' column missing in Sales Report."]
