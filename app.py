@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import io
 import re
 import traceback
@@ -100,7 +101,7 @@ class ReconciliationEngine:
         if pd.isna(val):
             return ""
         val = str(val).strip()
-        # Remove leading apostrophe if present (common in your Merge ST file)
+        # Remove leading apostrophe if present
         if val.startswith("'"):
             val = val[1:]
         return val
@@ -129,21 +130,17 @@ class ReconciliationEngine:
                 'Final Invoice Amount (Price after discount+Shipping Charges)': 'Final Invoice Amount'
             }
             
-            # Fuzzy match for column names
             sales_df.columns = [str(c).strip().replace("\n", " ") for c in sales_df.columns]
             
-            # Find 'Order Item ID' specifically
             oid_col = self.find_column_by_substring(sales_df, "Order Item ID")
             if oid_col:
                 sales_df.rename(columns={oid_col: 'Order Item ID'}, inplace=True)
             
             sales_df.rename(columns=sales_cols_map, inplace=True)
             
-            # Clean IDs in Sales Report
             if 'Order Item ID' in sales_df.columns:
                 sales_df['Order Item ID'] = sales_df['Order Item ID'].apply(self.clean_id)
 
-            # Clean Data Types
             if 'Item Quantity' in sales_df.columns:
                 sales_df['Item Quantity'] = pd.to_numeric(sales_df['Item Quantity'], errors='coerce').fillna(0)
             if 'Final Invoice Amount' in sales_df.columns:
@@ -152,7 +149,7 @@ class ReconciliationEngine:
             if auto_clean_sku and 'SKU' in sales_df.columns:
                 sales_df['SKU'] = sales_df['SKU'].apply(self.clean_sku)
 
-            # --- 2. PROCESS SETTLEMENT REPORT (MERGE ST Logic) ---
+            # --- 2. PROCESS SETTLEMENT REPORT ---
             if settlement_df is None or settlement_df.empty:
                 self.log("Error: No valid Settlement Data found.")
                 return None, None, self.logs
@@ -160,29 +157,23 @@ class ReconciliationEngine:
             if handle_merged:
                 settlement_df = settlement_df.ffill() 
 
-            # Identify "Bank Settlement Value"
             bsv_col = self.find_column_by_substring(settlement_df, "Bank Settlement Value")
             if not bsv_col:
                 bsv_col = self.find_column_by_substring(settlement_df, "Settlement Value")
             
             if not bsv_col:
                 self.log("Error: Could not locate 'Bank Settlement Value' column.")
-                self.log(f"Columns found: {list(settlement_df.columns)}")
                 return None, None, self.logs
 
-            # Identify "Order Item ID" in Settlement
             oid_col_settlement = self.find_column_by_substring(settlement_df, "Order Item ID")
             if not oid_col_settlement:
                  if len(settlement_df.columns) > 8:
                     oid_col_settlement = settlement_df.columns[8]
             
-            # Normalize Settlement Data & Clean IDs (Remove ' prefix)
             settlement_df[oid_col_settlement] = settlement_df[oid_col_settlement].apply(self.clean_id)
             settlement_df[bsv_col] = pd.to_numeric(settlement_df[bsv_col], errors='coerce').fillna(0)
 
-            # --- PIVOT LOGIC (AGGREGATE DUPLICATES) ---
-            # Group by Order Item ID and Sum the Settlement Value
-            # This fixes the "low payout" issue by combining split payments
+            # PIVOT LOGIC
             settlement_agg = settlement_df.groupby(oid_col_settlement)[bsv_col].sum().reset_index()
             settlement_agg.rename(columns={bsv_col: 'Bank Settlement Value (Rs.)', oid_col_settlement: 'Order Item ID'}, inplace=True)
             
@@ -221,23 +212,50 @@ class ReconciliationEngine:
                 'Cost Price': 0
             }, inplace=True)
 
-            # Calculate Total Cost Price (Unit Cost * Quantity)
-            merged_df['Total Cost Price'] = merged_df['Cost Price'] * merged_df['Item Quantity']
+            # 1. Base Cost Calculation (Unit Cost * Quantity)
+            merged_df['Base Total Cost'] = merged_df['Cost Price'] * merged_df['Item Quantity']
 
-            # Update Profit/Loss to use Total Cost Price
-            merged_df['Profit/Loss'] = merged_df['Bank Settlement Value (Rs.)'] - merged_df['Total Cost Price']
+            # 2. Logic for Applied Cost based on Settlement Value
+            # Conditions
+            # S > 0: Sale (100% Cost)
+            # S == 0: Unmatched/Pending (100% Cost - Loss)
+            # S <= -50: Cancellation (20% Cost)
+            # -50 < S < 0: Return (-50% Cost, i.e., Negative Cost)
             
-            # Identify unmatched rows
+            conditions = [
+                merged_df['Bank Settlement Value (Rs.)'] > 0,   # Sale
+                merged_df['Bank Settlement Value (Rs.)'] == 0,  # Unmatched
+                merged_df['Bank Settlement Value (Rs.)'] <= -50, # Cancellation
+                (merged_df['Bank Settlement Value (Rs.)'] > -50) & (merged_df['Bank Settlement Value (Rs.)'] < 0) # Return
+            ]
+            
+            choices = [
+                merged_df['Base Total Cost'],          # Sale: 100% Cost
+                merged_df['Base Total Cost'],          # Unmatched: 100% Cost
+                merged_df['Base Total Cost'] * 0.20,   # Cancel: 20% Cost (Positive)
+                merged_df['Base Total Cost'] * -0.50   # Return: -50% Cost (Negative)
+            ]
+            
+            # Apply Logic
+            merged_df['Applied Cost'] = np.select(conditions, choices, default=merged_df['Base Total Cost'])
+            
+            # Add Order Status Column for clarity
+            status_choices = ['Sale', 'Unmatched/Pending', 'Cancellation', 'Return']
+            merged_df['Order Status'] = np.select(conditions, status_choices, default='Unknown')
+
+            # 3. Final Profit/Loss Calculation
+            # P/L = Settlement - Applied Cost
+            merged_df['Profit/Loss'] = merged_df['Bank Settlement Value (Rs.)'] - merged_df['Applied Cost']
+            
             unmatched_rows = merged_df[merged_df['Bank Settlement Value (Rs.)'] == 0]
 
             # Output formatting
-            # Ensure ID is treated as text in Excel
             merged_df['Order Item ID'] = "'" + merged_df['Order Item ID'].astype(str)
 
             final_columns = [
-                'Order Date', 'Order Item ID', 'SKU', 'Item Quantity', 
+                'Order Date', 'Order Item ID', 'SKU', 'Item Quantity', 'Order Status',
                 'Final Invoice Amount', 'Bank Settlement Value (Rs.)', 
-                'Cost Price', 'Total Cost Price', 'Profit/Loss'
+                'Cost Price', 'Base Total Cost', 'Applied Cost', 'Profit/Loss'
             ]
             final_columns = [c for c in final_columns if c in merged_df.columns]
             final_output = merged_df[final_columns]
@@ -248,7 +266,8 @@ class ReconciliationEngine:
                 "Unmatched": len(unmatched_rows),
                 "Total Settlement Amount": final_output['Bank Settlement Value (Rs.)'].sum(),
                 "Total Invoice Amount": final_output['Final Invoice Amount'].sum() if 'Final Invoice Amount' in final_output else 0,
-                "Total Cost Amount": final_output['Total Cost Price'].sum() if 'Total Cost Price' in final_output else 0
+                "Total Applied Cost": final_output['Applied Cost'].sum() if 'Applied Cost' in final_output else 0,
+                "Total Net Profit/Loss": final_output['Profit/Loss'].sum()
             }
 
             return final_output, stats, self.logs
@@ -264,6 +283,14 @@ class ReconciliationEngine:
 
 st.set_page_config(page_title="Flipkart Reconciliation Tool", layout="wide")
 st.title("📊 Flipkart Reconciliation Tool")
+
+# --- INITIALIZE SESSION STATE ---
+if "result_df" not in st.session_state:
+    st.session_state.result_df = None
+if "stats" not in st.session_state:
+    st.session_state.stats = None
+if "logs" not in st.session_state:
+    st.session_state.logs = []
 
 # --- SIDEBAR CONFIGURATION ---
 st.sidebar.header("1. Upload Files")
@@ -321,8 +348,7 @@ if st.sidebar.button("Run Reconciliation", type="primary"):
                 dtype=str
             )
             
-            # 2. Load SETTLEMENT (Updated for Merge ST file)
-            # Adds "Sheet1" and "Working" to target sheets
+            # 2. Load SETTLEMENT
             settlement_master_df = load_multiple_files(
                 settlement_files, 
                 target_sheet_names=["Sheet1", "Working", "Orders", "Settlement"], 
@@ -352,55 +378,69 @@ if st.sidebar.button("Run Reconciliation", type="primary"):
                     auto_clean_sku=opt_clean_sku,
                     handle_merged=opt_merged
                 )
-
+            
+            # Save to Session State
+            st.session_state.result_df = result_df
+            st.session_state.stats = stats
+            st.session_state.logs = logs
+            
             if result_df is not None:
-                # Layout: Stats & Charts
-                col1, col2 = st.columns([1, 2])
-                
-                with col1:
-                    st.subheader("Summary")
-                    st.metric("Total Orders", stats["Total Orders"])
-                    st.metric("Total Settlement", f"₹{stats['Total Settlement Amount']:,.2f}")
-                    st.metric("Total Invoice Value", f"₹{stats['Total Invoice Amount']:,.2f}")
-                    st.metric("Total Cost", f"₹{stats['Total Cost Amount']:,.2f}")
-                
-                with col2:
-                    st.subheader("Match Rate")
-                    chart_data = pd.DataFrame({
-                        "Category": ["Matched", "Unmatched"],
-                        "Count": [stats["Matched with Settlement"], stats["Unmatched"]]
-                    })
-                    st.bar_chart(chart_data.set_index("Category"))
-
-                # Download Section
-                st.subheader("Download Output")
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    result_df.to_excel(writer, index=False, sheet_name='Reconciled')
-                    worksheet = writer.sheets['Reconciled']
-                    for idx, col in enumerate(result_df.columns):
-                        worksheet.set_column(idx, idx, 20)
-                output.seek(0)
-                
-                st.download_button(
-                    label="📥 Download Reconciled_Output.xlsx",
-                    data=output,
-                    file_name="Reconciled_Output.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-
-                st.dataframe(result_df.head(100))
-                
-                # Logs
-                if logs:
-                    with st.expander("Processing Logs", expanded=False):
-                        for log in logs:
-                            st.write(f"- {log}")
+                st.rerun() 
             else:
-                st.error("Processing failed.")
-                for log in logs:
+                 st.error("Processing failed.")
+                 for log in logs:
                     st.write(log)
         else:
             st.error("Failed to load valid data from the uploaded files.")
-else:
+elif not sales_files and not settlement_files:
     st.info("👈 Upload files in the sidebar and click 'Run Reconciliation'.")
+
+
+# --- DISPLAY RESULTS FROM SESSION STATE ---
+if st.session_state.result_df is not None:
+    result_df = st.session_state.result_df
+    stats = st.session_state.stats
+    logs = st.session_state.logs
+
+    # Layout: Stats & Charts
+    col1, col2, col3 = st.columns([1, 1, 1])
+    
+    with col1:
+        st.subheader("Overview")
+        st.metric("Total Orders", stats["Total Orders"])
+        st.metric("Total Settlement", f"₹{stats['Total Settlement Amount']:,.2f}")
+    
+    with col2:
+        st.subheader("Financials")
+        st.metric("Total Applied Cost", f"₹{stats['Total Applied Cost']:,.2f}")
+        st.metric("Net Profit/Loss", f"₹{stats['Total Net Profit/Loss']:,.2f}")
+        
+    with col3:
+        st.subheader("Order Split")
+        status_counts = result_df['Order Status'].value_counts()
+        st.bar_chart(status_counts)
+
+    # Download Section
+    st.subheader("Download Output")
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        result_df.to_excel(writer, index=False, sheet_name='Reconciled')
+        worksheet = writer.sheets['Reconciled']
+        for idx, col in enumerate(result_df.columns):
+            worksheet.set_column(idx, idx, 22)
+    output.seek(0)
+    
+    st.download_button(
+        label="📥 Download Reconciled_Output.xlsx",
+        data=output,
+        file_name="Reconciled_Output.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    st.dataframe(result_df.head(100))
+    
+    # Logs
+    if logs:
+        with st.expander("Processing Logs", expanded=False):
+            for log in logs:
+                st.write(f"- {log}")
