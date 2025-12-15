@@ -195,12 +195,48 @@ class ReconciliationEngine:
             }, inplace=True)
 
             # ----------------------------------------------
-            # NEW: ROYALTY & BASE COST LOGIC
+            # STEP A: Calculate Raw Manufacturing Cost
             # ----------------------------------------------
-            # 1. Manufacturing Cost (Unit Cost * Quantity)
-            merged_df['Manufacturing Cost'] = merged_df['Cost Price'] * merged_df['Item Quantity']
+            merged_df['Raw Mfg Cost'] = merged_df['Cost Price'] * merged_df['Item Quantity']
 
-            # 2. Royalty Logic
+            # ----------------------------------------------
+            # STEP B: Determine Order Status
+            # ----------------------------------------------
+            # S > 0: Sale
+            # S == 0: Unmatched/Pending
+            # S <= -50: Cancellation
+            # -50 < S < 0: Return
+            
+            conditions_status = [
+                merged_df['Bank Settlement Value (Rs.)'] > 0,   # Sale
+                merged_df['Bank Settlement Value (Rs.)'] == 0,  # Unmatched
+                merged_df['Bank Settlement Value (Rs.)'] <= -50, # Cancellation
+                (merged_df['Bank Settlement Value (Rs.)'] > -50) & (merged_df['Bank Settlement Value (Rs.)'] < 0) # Return
+            ]
+            
+            status_choices = ['Sale', 'Unmatched/Pending', 'Cancellation', 'Return']
+            merged_df['Order Status'] = np.select(conditions_status, status_choices, default='Unknown')
+
+            # ----------------------------------------------
+            # STEP C: Apply Logic to Product Cost (Mfg Cost)
+            # ----------------------------------------------
+            # Sale: 100% of Raw Cost
+            # Unmatched: 100% of Raw Cost
+            # Cancellation: 20% of Raw Cost (80% recovered)
+            # Return: 50% of Raw Cost (50% recovered)
+            
+            choices_mfg_adjusted = [
+                merged_df['Raw Mfg Cost'],          # Sale
+                merged_df['Raw Mfg Cost'],          # Unmatched
+                merged_df['Raw Mfg Cost'] * 0.20,   # Cancellation
+                merged_df['Raw Mfg Cost'] * 0.50    # Return
+            ]
+            
+            merged_df['Adjusted Mfg Cost'] = np.select(conditions_status, choices_mfg_adjusted, default=merged_df['Raw Mfg Cost'])
+
+            # ----------------------------------------------
+            # STEP D: Calculate Royalty
+            # ----------------------------------------------
             # MKUC, DKUC, MAC -> 10%
             # DYK, MYK -> 7%
             conditions_royalty = [
@@ -212,89 +248,15 @@ class ReconciliationEngine:
             merged_df['Royalty Rate'] = np.select(conditions_royalty, choices_royalty, default=0.0)
             merged_df['Royalty Amount'] = merged_df['Final Invoice Amount'] * merged_df['Royalty Rate']
 
-            # 3. Base Total Cost = Mfg Cost + Royalty
-            merged_df['Base Total Cost'] = merged_df['Manufacturing Cost'] + merged_df['Royalty Amount']
+            # ----------------------------------------------
+            # STEP E: Final Applied Cost
+            # ----------------------------------------------
+            # Final Cost = Adjusted Mfg Cost + Royalty Amount
+            merged_df['Applied Cost'] = merged_df['Adjusted Mfg Cost'] + merged_df['Royalty Amount']
 
             # ----------------------------------------------
-            # LOGIC FOR APPLIED COST (Sale vs Cancel vs Return)
+            # STEP F: Profit/Loss
             # ----------------------------------------------
-            # S > 0: Sale (100% Cost)
-            # S == 0: Unmatched/Pending (100% Cost - Loss)
-            # S <= -50: Cancellation (Recoup 80% Cost -> Net 20% Cost)
-            # -50 < S < 0: Return (Recoup 50% Cost -> Net 50% Cost)
-            
-            conditions_status = [
-                merged_df['Bank Settlement Value (Rs.)'] > 0,   # Sale
-                merged_df['Bank Settlement Value (Rs.)'] == 0,  # Unmatched
-                merged_df['Bank Settlement Value (Rs.)'] <= -50, # Cancellation
-                (merged_df['Bank Settlement Value (Rs.)'] > -50) & (merged_df['Bank Settlement Value (Rs.)'] < 0) # Return
-            ]
-            
-            choices_cost = [
-                merged_df['Base Total Cost'],          # Sale: 100% Cost
-                merged_df['Base Total Cost'],          # Unmatched: 100% Cost
-                merged_df['Base Total Cost'] * -0.80,  # Cancel: -80% Cost (Negative Applied means cost recovery)
-                merged_df['Base Total Cost'] * -0.50   # Return: -50% Cost (Negative Applied means cost recovery)
-                # Note: This logic assumes 'Profit = Settlement - Applied Cost'. 
-                # If we subtract a negative cost, we are adding profit (recovery).
-                # Wait, earlier you said "Net Cost 20%".
-                # If Base Cost = 100. Cancel Logic = -80?
-                # P/L = Settlement (-60) - Applied Cost (-80) = +20 (Profit?? No)
-                # Let's re-verify the request: "Cancel wale ki cost value terko 20% leni h"
-                # If Settlement is -60 (Loss), and we treat cost as 20.
-                # P/L should be -60 - 20 = -80.
-                # BUT you said "80 percent negetive m... final cost ho jaegi iski 20"
-                # If I use 0.20 as choice:
-                # P/L = -60 - 20 = -80. This looks correct for a cancellation penalty + small cost.
-                
-                # Let's look at your previous prompt: "Cancel -80 final cost ho jaegi iski 20"
-                # "negetive m le" -> This implied Recouping.
-                # If I use 0.20 * BaseCost:
-                #   Cost = 20.
-                #   PL = -60 (Settlement) - 20 (Cost) = -80.
-                # If I use -0.80 * BaseCost (Negative Cost logic):
-                #   Cost = -80.
-                #   PL = -60 (Settlement) - (-80) = +20.
-                
-                # WHICH ONE DO YOU WANT? 
-                # "cancel -80 final cost ho jaegi iski 20"
-                # Usually in cancellations, you lose the shipping/penalty (-60) AND you incur some packing cost (20). Total Loss = -80.
-                # So Applied Cost should be POSITIVE 20% of Base Cost.
-                # BUT you said "negetive m le".
-                # If I take -80%, it implies I SAVED 80% of the cost (Inventory back).
-                # So if I spent 100, got product back, my real cost is only 20.
-                # So P/L = Settlement - NetCost(20).
-                
-                # Let's stick to the multiplier logic I used in previous successful code, 
-                # but modified for your "80% negative" instruction which I interpreted as:
-                # "Reduce cost by 80%" => Cost becomes 20%.
-                # So I will use 0.20 and 0.50 POSITIVE multipliers.
-                # Because "Profit = Settlement - Cost".
-                # If Settlement = -50 (Penalty). Cost = 20 (Packaging).
-                # Net P/L = -50 - 20 = -70.
-            ]
-            
-            # Re-reading: "80 percent negetive m... final cost ho jaegi iski 20"
-            # This confirms Final Cost = 20.
-            # So the applied cost value in the column should be 20.
-            # So multiplier is 0.20.
-            
-            choices_cost = [
-                 merged_df['Base Total Cost'],        # Sale
-                 merged_df['Base Total Cost'],        # Unmatched
-                 merged_df['Base Total Cost'] * 0.20, # Cancel (Net Cost is 20%)
-                 merged_df['Base Total Cost'] * 0.50  # Return (Net Cost is 50%)
-            ]
-            
-            # Apply Logic
-            merged_df['Applied Cost'] = np.select(conditions_status, choices_cost, default=merged_df['Base Total Cost'])
-            
-            # Add Order Status Column
-            status_choices = ['Sale', 'Unmatched/Pending', 'Cancellation', 'Return']
-            merged_df['Order Status'] = np.select(conditions_status, status_choices, default='Unknown')
-
-            # 4. Final Profit/Loss Calculation
-            # P/L = Settlement - Applied Cost
             merged_df['Profit/Loss'] = merged_df['Bank Settlement Value (Rs.)'] - merged_df['Applied Cost']
             
             unmatched_rows = merged_df[merged_df['Bank Settlement Value (Rs.)'] == 0]
@@ -305,7 +267,8 @@ class ReconciliationEngine:
             final_columns = [
                 'Order Date', 'Order Item ID', 'SKU', 'Item Quantity', 'Order Status',
                 'Final Invoice Amount', 'Bank Settlement Value (Rs.)', 
-                'Cost Price', 'Royalty Rate', 'Royalty Amount', 'Base Total Cost', 'Applied Cost', 'Profit/Loss'
+                'Cost Price', 'Raw Mfg Cost', 'Adjusted Mfg Cost',
+                'Royalty Rate', 'Royalty Amount', 'Applied Cost', 'Profit/Loss'
             ]
             final_columns = [c for c in final_columns if c in merged_df.columns]
             final_output = merged_df[final_columns]
